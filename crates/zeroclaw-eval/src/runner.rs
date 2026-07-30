@@ -18,10 +18,42 @@ use crate::record::RunRecord;
 use crate::report::{CaseReport, SuiteReport};
 use crate::tools::default_tools;
 
-/// Factory that builds a fresh model provider for one case run. Injected so
-/// replay, live, and deterministic tests share one runner code path.
-pub type ProviderFactory =
-    Box<dyn Fn(&LlmTrace) -> anyhow::Result<Box<dyn ModelProvider>> + Send + Sync>;
+/// Callback the runner invokes after each conversation turn completes, in replay
+/// mode only, to assert the turn's scripted steps were fully consumed (over-spec
+/// guard) and advance the replay cursor. `None` for live and other non-replay
+/// providers, which have no per-turn script to exhaust.
+pub type FinishTurnFn = Box<dyn Fn(usize) -> anyhow::Result<()> + Send + Sync>;
+
+/// A model provider for one case run, plus the metadata the runner needs to wire
+/// it into the agent correctly. Bundling this (rather than a bare boxed provider)
+/// lets the factory carry configured-model metadata (item 2) and the replay
+/// per-turn boundary handle (item 3) across the `RunDeps` closure boundary.
+pub struct CaseProvider {
+    pub provider: Box<dyn ModelProvider>,
+    /// Sets `Agent::builder().model_provider_name(..)` when present.
+    pub provider_name: Option<String>,
+    /// Sets `Agent::builder().model_name(..)` when present; this is the value
+    /// passed to every `provider.chat` call for the built agent.
+    pub model_name: Option<String>,
+    /// Replay-only per-turn exhaustion boundary; `None` for live.
+    pub finish_turn: Option<FinishTurnFn>,
+}
+
+impl CaseProvider {
+    /// Wrap a bare provider with no metadata and no replay boundary.
+    pub fn from_provider(provider: Box<dyn ModelProvider>) -> Self {
+        Self {
+            provider,
+            provider_name: None,
+            model_name: None,
+            finish_turn: None,
+        }
+    }
+}
+
+/// Factory that builds a fresh model provider (plus metadata) for one case run.
+/// Injected so replay, live, and deterministic tests share one runner code path.
+pub type ProviderFactory = Box<dyn Fn(&LlmTrace) -> anyhow::Result<CaseProvider> + Send + Sync>;
 
 /// Everything a case run needs that differs between replay, live, and tests.
 ///
@@ -44,10 +76,14 @@ impl RunDeps {
         Self {
             mode: Mode::Replay,
             provider: Box::new(|trace| {
-                Ok(
-                    Box::new(crate::replay::TraceLlmProvider::try_from_trace(trace)?)
-                        as Box<dyn ModelProvider>,
-                )
+                let provider = crate::replay::TraceLlmProvider::try_from_trace(trace)?;
+                let handle = provider.handle();
+                Ok(CaseProvider {
+                    provider: Box::new(provider),
+                    provider_name: None,
+                    model_name: None,
+                    finish_turn: Some(Box::new(move |turn_index| handle.finish_turn(turn_index))),
+                })
             }),
             live_tools: Vec::new(),
             case_timeout: Duration::from_secs(120),
@@ -125,7 +161,11 @@ async fn run_replay_case(trace: &LlmTrace, deps: &RunDeps) -> anyhow::Result<Run
     let memory: Arc<dyn Memory> = Arc::from(create_memory(&mem_cfg, tmp.path(), None)?);
 
     let observer = Arc::new(RecordingObserver::new());
-    let provider = (deps.provider)(trace)?;
+    let CaseProvider {
+        provider,
+        finish_turn,
+        ..
+    } = (deps.provider)(trace)?;
 
     // The engine's tool registry is sealed (`ScopedToolRegistry`), mintable only
     // through the one assembly seam. Route the eval harness's fixed tool set
@@ -167,8 +207,11 @@ async fn run_replay_case(trace: &LlmTrace, deps: &RunDeps) -> anyhow::Result<Run
         .build()?;
 
     let mut final_response = String::new();
-    for turn in &trace.turns {
+    for (turn_index, turn) in trace.turns.iter().enumerate() {
         final_response = agent.turn(&turn.user_input).await?;
+        if let Some(finish) = &finish_turn {
+            finish(turn_index)?;
+        }
     }
 
     let (input_tokens, output_tokens) = observer.tokens();
@@ -245,6 +288,74 @@ mod tests {
             record.final_response.contains("Goodbye"),
             "final response: {:?}",
             record.final_response
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_rejects_overspecified_turn_at_boundary() {
+        // Turn 0 scripts two text steps, but the agent's turn loop stops after
+        // the first text response (no tool call to keep the round-trip going),
+        // so "Leftover never requested." is never popped. The per-turn boundary
+        // (`finish_turn`) must catch this leftover step at turn-end, rather than
+        // silently letting it bleed into turn 1's replay (the pre-fix behavior:
+        // the flattened single-queue provider would hand "Leftover never
+        // requested." to turn 1 instead of "Second.", with no error at all).
+        let trace: LlmTrace = serde_json::from_str(
+            r#"{
+                "model_name": "test-overspecified-turn",
+                "turns": [
+                    {
+                        "user_input": "Hi",
+                        "steps": [
+                            { "response": { "type": "text", "content": "First." } },
+                            { "response": { "type": "text", "content": "Leftover never requested." } }
+                        ]
+                    },
+                    { "user_input": "Again", "steps": [{ "response": { "type": "text", "content": "Second." } }] }
+                ],
+                "expects": {}
+            }"#,
+        )
+        .unwrap();
+        let err = run_case(&trace, &RunDeps::replay()).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("turn 0"), "error must name turn 0: {msg}");
+        assert!(
+            msg.contains("over-specifies"),
+            "error must call out the over-specification: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_turn_cannot_borrow_next_turns_steps() {
+        // Turn 0 scripts only a tool call, so after the agent executes the tool
+        // it needs a follow-up LLM response within turn 0 that was never
+        // scripted. Turn 1 has its own steps, kept in a separate queue, and
+        // must not be reachable from turn 0's replay: the error must be the
+        // turn-scoped exhaustion guard naming turn 0, not a borrowed "Borrowed."
+        // response from turn 1.
+        let trace: LlmTrace = serde_json::from_str(
+            r#"{
+                "model_name": "test-turn-boundary",
+                "turns": [
+                    {
+                        "user_input": "Echo hello for me",
+                        "steps": [
+                            { "response": { "type": "tool_calls", "tool_calls": [{ "id": "call_1", "name": "echo", "arguments": {"message": "hello"} }] } }
+                        ]
+                    },
+                    { "user_input": "Again", "steps": [{ "response": { "type": "text", "content": "Borrowed." } }] }
+                ],
+                "expects": {}
+            }"#,
+        )
+        .unwrap();
+        let err = run_case(&trace, &RunDeps::replay()).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("turn 0"), "error must name turn 0: {msg}");
+        assert!(
+            !msg.contains("Borrowed"),
+            "error must not have consumed turn 1's steps: {msg}"
         );
     }
 

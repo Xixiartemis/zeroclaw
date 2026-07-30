@@ -8,15 +8,18 @@ use std::sync::Arc;
 use zeroclaw_api::tool::Tool;
 use zeroclaw_config::autonomy::AutonomyLevel;
 use zeroclaw_config::policy::SecurityPolicy;
-use zeroclaw_config::schema::{AliasedAgentConfig, MemoryConfig, RiskProfileConfig};
+use zeroclaw_config::schema::{
+    AliasedAgentConfig, MemoryConfig, RiskProfileConfig, SandboxBackend, SandboxConfig,
+};
 use zeroclaw_memory::{Memory, create_memory};
 use zeroclaw_runtime::agent::agent::{Agent, tool_dispatcher_for_provider};
 use zeroclaw_runtime::approval::ApprovalManager;
+use zeroclaw_runtime::security::Sandbox;
 
 use crate::case::{CaseSetup, LlmTrace, validate_workspace_rel_path};
 use crate::observer::RecordingObserver;
 use crate::record::RunRecord;
-use crate::runner::RunDeps;
+use crate::runner::{CaseProvider, RunDeps};
 
 /// Intersect a case's requested tools with the config allowlist, preserving the
 /// allowlist's order and de-duplicating. An empty allowlist yields no tools.
@@ -57,17 +60,65 @@ pub fn write_setup_files(workspace: &Path, setup: &CaseSetup) -> anyhow::Result<
 }
 
 /// Build the live tool registry. With no allowlisted tools, use the Phase 0 echo
-/// registry (a harmless deterministic tool). With an allowlist, use the runtime
-/// default tools filtered to the allowlist by name — the registry filter is the
-/// primary guard; the builder allowlist (set by the caller) is defense in depth.
-fn live_tool_registry(effective: &[String], policy: Arc<SecurityPolicy>) -> Vec<Box<dyn Tool>> {
+/// registry (a harmless deterministic tool). With an allowlist that includes
+/// `shell`, the shell tool MUST be wrapped in a real OS sandbox backend before
+/// it is allowed to run: this is fail-closed, not fail-open, so a platform with
+/// no available sandbox backend errors here rather than silently falling back
+/// to an unsandboxed shell. With an allowlist that doesn't include `shell`,
+/// the runtime default tools (unsandboxed shell tool included, but filtered
+/// out below) are used as-is, and the registry filter is the primary guard; the
+/// builder allowlist (set by the caller) is defense in depth.
+fn live_tool_registry(
+    effective: &[String],
+    policy: Arc<SecurityPolicy>,
+) -> anyhow::Result<Vec<Box<dyn Tool>>> {
     if effective.is_empty() {
-        crate::tools::default_tools()
-    } else {
-        let mut tools = zeroclaw_runtime::tools::default_tools(policy);
-        tools.retain(|t| effective.iter().any(|name| name == t.name()));
-        tools
+        return Ok(crate::tools::default_tools());
     }
+    let mut tools = if effective.iter().any(|t| t == "shell") {
+        let sandbox = live_shell_sandbox(&policy.workspace_dir)?;
+        zeroclaw_runtime::tools::default_tools_with_sandbox(policy, sandbox)
+    } else {
+        zeroclaw_runtime::tools::default_tools(policy)
+    };
+    tools.retain(|t| effective.iter().any(|name| name == t.name()));
+    Ok(tools)
+}
+
+/// Resolve the OS sandbox backend that will confine the live shell tool's
+/// subprocesses to `workspace` (plus each backend's fixed system-temp
+/// allowance; see the threat-model doc). Fails closed via
+/// [`ensure_real_sandbox`] if no real backend is available on this platform.
+pub fn live_shell_sandbox(workspace: &Path) -> anyhow::Result<Arc<dyn Sandbox>> {
+    let sandbox = zeroclaw_runtime::security::create_sandbox(
+        &SandboxConfig {
+            enabled: Some(true),
+            backend: SandboxBackend::Auto,
+            firejail_args: Vec::new(),
+        },
+        "native",
+        Some(workspace),
+    );
+    ensure_real_sandbox(sandbox.as_ref())?;
+    Ok(sandbox)
+}
+
+/// Fail-closed guard: a live case that requests `shell` must run under a real
+/// OS sandbox backend. `create_sandbox` falls back to `NoopSandbox` (name
+/// `"none"`) when no backend is available or detection fails; that fallback is
+/// the right choice for the rest of the runtime (application-layer security
+/// still applies), but is never acceptable for live mode's real-provider shell
+/// access, so it is rejected here rather than silently accepted.
+fn ensure_real_sandbox(sandbox: &dyn Sandbox) -> anyhow::Result<()> {
+    if sandbox.name() == "none" {
+        anyhow::bail!(
+            "live case requests 'shell' but no OS sandbox backend is available on this platform \
+             (Landlock [Linux, feature sandbox-landlock], Firejail, or sandbox-exec [macOS]); \
+             refusing to run shell unsandboxed - remove 'shell' from case tools / \
+             [eval].live_allowed_tools or enable a sandbox backend"
+        );
+    }
+    Ok(())
 }
 
 /// Drive one live case: build a sandboxed agent, run each turn under a wall-clock
@@ -101,7 +152,7 @@ pub async fn run_live_case(trace: &LlmTrace, deps: &RunDeps) -> anyhow::Result<R
     };
     let approvals = Arc::new(ApprovalManager::for_non_interactive_backchannel(&risk));
 
-    let tools = live_tool_registry(&effective, policy.clone());
+    let tools = live_tool_registry(&effective, policy.clone())?;
     // Empty allowlist -> None so the echo registry's own tool is usable; a
     // `Some(vec![])` would deny every tool including echo. Non-empty -> the
     // allowlist backs the already-filtered registry as defense in depth.
@@ -118,13 +169,23 @@ pub async fn run_live_case(trace: &LlmTrace, deps: &RunDeps) -> anyhow::Result<R
     let memory: Arc<dyn Memory> = Arc::from(create_memory(&mem_cfg, tmp.path(), None)?);
 
     let observer = Arc::new(RecordingObserver::new());
-    let provider = (deps.provider)(trace)?;
+    // `finish_turn` is the replay-only per-turn exhaustion boundary (see
+    // `runner::run_replay_case`); live must never call it. Driver traces used in
+    // live tests script every step within one driver-side turn that is not
+    // aligned to the case's turns, and a real live provider has no scripted
+    // queue at all, so there is no per-turn boundary to enforce here.
+    let CaseProvider {
+        provider,
+        provider_name,
+        model_name,
+        finish_turn: _,
+    } = (deps.provider)(trace)?;
     // Resolve the dispatcher from the provider's capabilities so XML-dialect
     // providers work; a default agent config routes purely by capability.
     let dispatcher =
         tool_dispatcher_for_provider(&AliasedAgentConfig::default(), provider.as_ref());
 
-    let mut agent = Agent::builder()
+    let mut builder = Agent::builder()
         .model_provider(provider)
         .tools(tools)
         .memory(memory)
@@ -133,8 +194,14 @@ pub async fn run_live_case(trace: &LlmTrace, deps: &RunDeps) -> anyhow::Result<R
         .workspace_dir(tmp.path().to_path_buf())
         .allowed_tools(allowed_arg)
         .autonomy_level(AutonomyLevel::Supervised)
-        .approval_manager(Some(approvals))
-        .build()?;
+        .approval_manager(Some(approvals));
+    if let Some(model) = model_name {
+        builder = builder.model_name(model);
+    }
+    if let Some(ptype) = provider_name {
+        builder = builder.model_provider_name(ptype);
+    }
+    let mut agent = builder.build()?;
 
     let mut final_response = String::new();
     for (i, turn) in trace.turns.iter().enumerate() {
@@ -175,6 +242,9 @@ mod tests {
     };
 
     /// Build a `RunDeps` for the live path with an injected provider factory.
+    /// The factory returns a bare boxed provider; it is wrapped in a
+    /// metadata-free `CaseProvider` here so existing tests don't need to know
+    /// about the `CaseProvider` boundary.
     fn live_deps(
         provider: impl Fn(&LlmTrace) -> anyhow::Result<Box<dyn ModelProvider>> + Send + Sync + 'static,
         live_tools: Vec<String>,
@@ -182,7 +252,7 @@ mod tests {
     ) -> RunDeps {
         RunDeps {
             mode: Mode::Live,
-            provider: Box::new(provider),
+            provider: Box::new(move |trace| Ok(CaseProvider::from_provider(provider(trace)?))),
             live_tools,
             case_timeout: timeout,
         }
@@ -206,9 +276,27 @@ mod tests {
     #[test]
     fn empty_allowlist_yields_echo_only_registry() {
         let policy = Arc::new(SecurityPolicy::default());
-        let registry = live_tool_registry(&[], policy);
+        let registry = live_tool_registry(&[], policy).unwrap();
         assert_eq!(registry.len(), 1);
         assert_eq!(registry[0].name(), "echo");
+    }
+
+    #[test]
+    fn noop_sandbox_is_rejected_for_live_shell() {
+        // The fail-closed guard: a `NoopSandbox` (the "no real backend available"
+        // fallback `create_sandbox` returns) must never be accepted for a live
+        // case that requests `shell`. The error must name the remediation
+        // (drop `shell` from the allowlist, or enable a sandbox backend).
+        let err = ensure_real_sandbox(&zeroclaw_runtime::security::NoopSandbox).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no OS sandbox backend is available"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("live_allowed_tools") || msg.contains("enable a sandbox backend"),
+            "error must name a remediation: {msg}"
+        );
     }
 
     #[test]
@@ -387,6 +475,96 @@ mod tests {
         assert!(
             !record.all_tools_succeeded,
             "the out-of-workspace file_write must not report success"
+        );
+    }
+
+    /// A provider that records the `model` string it is called with on every
+    /// `chat` invocation, so tests can assert the agent was actually built with
+    /// the configured model rather than `Agent::builder()`'s "<unconfigured>"
+    /// default.
+    struct ModelRecordingProvider {
+        seen: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+    impl Attributable for ModelRecordingProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+        fn alias(&self) -> &str {
+            "recorder"
+        }
+    }
+    #[async_trait]
+    impl ModelProvider for ModelRecordingProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                native_tool_calling: true,
+                ..ProviderCapabilities::default()
+            }
+        }
+        async fn chat_with_system(
+            &self,
+            _s: Option<&str>,
+            _m: &str,
+            _model: &str,
+            _t: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+        async fn chat(
+            &self,
+            _r: ChatRequest<'_>,
+            model: &str,
+            _t: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            self.seen.lock().unwrap().push(model.to_string());
+            Ok(ChatResponse {
+                text: Some("ok".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn live_agent_calls_provider_with_configured_model() {
+        // Before the `CaseProvider` metadata plumbing, `src/commands/eval.rs`
+        // discarded the resolved provider type and model name returned by
+        // `build_session_model_provider`, so the live agent was always built
+        // with `Agent::builder()`'s "<unconfigured>" default model regardless
+        // of what `[eval].live_provider` configured. This asserts every `chat`
+        // call the agent makes carries the configured model name through.
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_for_factory = seen.clone();
+
+        let trace: LlmTrace = serde_json::from_str(
+            r#"{ "model_name": "metadata-case", "turns": [{ "user_input": "hi" }] }"#,
+        )
+        .unwrap();
+
+        let deps = RunDeps {
+            mode: Mode::Live,
+            provider: Box::new(move |_trace: &LlmTrace| {
+                Ok(CaseProvider {
+                    provider: Box::new(ModelRecordingProvider {
+                        seen: seen_for_factory.clone(),
+                    }),
+                    provider_name: Some("testprov".to_string()),
+                    model_name: Some("model-under-test".to_string()),
+                    finish_turn: None,
+                })
+            }),
+            live_tools: Vec::new(),
+            case_timeout: Duration::from_secs(5),
+        };
+
+        run_live_case(&trace, &deps).await.unwrap();
+
+        let seen = seen.lock().unwrap();
+        assert!(!seen.is_empty(), "provider.chat was never called");
+        assert!(
+            seen.iter().all(|m| m == "model-under-test"),
+            "every chat call must carry the configured model: {seen:?}"
         );
     }
 }

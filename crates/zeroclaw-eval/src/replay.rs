@@ -28,7 +28,6 @@ fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         Err(poisoned) => poisoned.into_inner(),
     }
 }
-
 /// Replays a trace's scripted steps in FIFO order, one queue per conversation turn.
 ///
 /// The provider is opaque to the runner (it is injected as a boxed `ModelProvider`

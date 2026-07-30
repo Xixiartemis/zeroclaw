@@ -13,7 +13,7 @@ pub mod tools;
 pub use case::{CaseSetup, LlmTrace, TraceExpects};
 pub use record::RunRecord;
 pub use report::{CaseReport, SuiteReport};
-pub use runner::{RunDeps, ensure_live_provider, run_case, run_suite};
+pub use runner::{CaseProvider, RunDeps, ensure_live_provider, run_case, run_suite};
 
 use std::str::FromStr;
 

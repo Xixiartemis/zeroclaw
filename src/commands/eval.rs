@@ -4,7 +4,7 @@ use anyhow::Result;
 use std::path::PathBuf;
 use std::time::Duration;
 use zeroclaw_config::schema::Config;
-use zeroclaw_eval::{LlmTrace, Mode, RunDeps, SuiteReport};
+use zeroclaw_eval::{CaseProvider, LlmTrace, Mode, RunDeps, SuiteReport};
 use zeroclaw_runtime::agent::agent::build_session_model_provider;
 
 /// Build the per-run dependencies for the requested mode, threading the loaded
@@ -27,9 +27,14 @@ fn build_run_deps(config: &Config, mode: Mode) -> Result<RunDeps> {
             Ok(RunDeps {
                 mode,
                 provider: Box::new(move |_trace: &LlmTrace| {
-                    let (provider, _provider_type, _resolved_model) =
+                    let (provider, provider_type, resolved_model) =
                         build_session_model_provider(&cfg, &provider_ref, None)?;
-                    Ok(provider)
+                    Ok(CaseProvider {
+                        provider,
+                        provider_name: Some(provider_type),
+                        model_name: Some(resolved_model),
+                        finish_turn: None,
+                    })
                 }),
                 live_tools: config.eval.live_allowed_tools.clone(),
                 case_timeout: Duration::from_secs(config.eval.case_timeout_secs),
