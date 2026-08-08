@@ -5895,7 +5895,12 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     mode.unwrap_or_else(|| config.eval.mode.clone()).parse()?;
                 let report = commands::eval::run(std::path::PathBuf::from(suite_dir), mode).await?;
                 commands::eval::print_report(&report, format);
-                std::process::exit(report.exit_code());
+                // Only a failing suite needs the hard exit to carry a non-zero
+                // status; a passing run returns normally so shutdown runs.
+                match report.exit_code() {
+                    0 => Ok(()),
+                    code => std::process::exit(code),
+                }
             }
         },
 
