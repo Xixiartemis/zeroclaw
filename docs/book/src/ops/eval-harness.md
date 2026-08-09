@@ -69,13 +69,29 @@ Each live case runs inside a sandbox:
 ### Shell is excluded
 
 `shell` can never be part of the live tool surface, even when a case's `tools`
-and `[eval].live_allowed_tools` both request it — `effective_live_tools`
+and `[eval].live_allowed_tools` both request it. `effective_live_tools`
 (`crates/zeroclaw-eval/src/live.rs`) applies a hard denylist to the allowlist
-intersection, so deny always wins. A scripted `shell` tool call in a live case
-reaches the agent's tool-dispatch path and fails there ("tool not available"),
-rather than executing.
+intersection, so deny always wins.
 
-This is the ship-safe interim posture chosen on the #9214 review thread. An
+A scripted `shell` tool call in a live case is stopped *before* tool dispatch,
+by the approval gate. Because `shell` is excluded from the effective tool set,
+it is also excluded from `risk.auto_approve` (both are built from the same set
+in `run_live_case`), so its approval requirement resolves to `Prompt`. Live
+mode wires a non-interactive backchannel, so there is no operator to ask and
+the runtime denies the call by policy. What the model sees fed back is a
+runtime-policy denial, not shell output and not a "tool not available"
+dispatch error:
+
+```text
+Tool call not executed: 'shell' requires approval and no operator decision was
+available, so the runtime denied it by policy. This was not a user's decision.
+```
+
+Operators debugging a live case that expected `shell` should therefore look for
+the approval-gate denial (a WARN record with `denied_by_runtime`), not for a
+tool-registry lookup failure.
+
+This is the ship-safe interim posture. An
 earlier version of this harness wrapped `shell`'s subprocesses in a real OS
 sandbox backend (Landlock, Firejail, or `sandbox-exec`) instead of excluding
 it outright, but every accepted backend still permitted host *reads* wide
@@ -86,7 +102,7 @@ enough to leak host data back into the conversation sent to a real provider:
   with `/usr` and `/bin` readable. Network was NOT restricted (no `AccessNet`
   rule); a sandboxed shell command could still reach the network freely.
 - macOS, `sandbox-exec` (Seatbelt): deny-by-default for writes, but reads were
-  allowed broadly — system paths (`/usr`, `/bin`, `/sbin`, `/Library`,
+  allowed broadly: system paths (`/usr`, `/bin`, `/sbin`, `/Library`,
   `/System`, `/etc`, `/opt`, and others) and the invoking user's dotfile
   directories under `$HOME`.
 - Firejail (Linux, no `sandbox-landlock` feature): `--private=home` with
@@ -96,8 +112,8 @@ enough to leak host data back into the conversation sent to a real provider:
 Confining the *writes* (which those backends do well; see
 `crates/zeroclaw-eval/tests/live_shell_sandbox.rs`'s history for the escape
 tests this proved) was not sufficient, because live-mode tool output becomes
-part of the conversation sent to the configured provider — a confidentiality
-boundary, not just an integrity one. Re-admitting `shell` needs an
+part of the conversation sent to the configured provider, making it a
+confidentiality boundary and not just an integrity one. Re-admitting `shell` needs an
 eval-specific sandbox contract that also denies sensitive host reads on every
 accepted backend; that is a deliberate, tracked follow-up, not implemented
 here. `live_shell_sandbox`/`ensure_real_sandbox` (the OS-sandbox construction
