@@ -1,7 +1,7 @@
 //! Regression coverage for live mode's hard `shell` exclusion (see
 //! `docs/book/src/ops/eval-harness.md`'s "Live mode" table,
-//! `crates/zeroclaw-eval/src/live.rs`'s `LIVE_TOOL_DENYLIST`, and the #9214
-//! review thread): a live case can never make `shell` part of its effective
+//! `crates/zeroclaw-eval/src/live.rs`'s `LIVE_TOOL_DENYLIST`): a live case
+//! can never make `shell` part of its effective
 //! tool surface, even when both the case's own `tools` and
 //! `[eval].live_allowed_tools` explicitly request it.
 //!

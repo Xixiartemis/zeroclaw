@@ -27,7 +27,8 @@ use crate::runner::{CaseProvider, RunDeps};
 /// always wins over both inputs.
 ///
 /// Live-mode tool output becomes part of the conversation sent to a real,
-/// configured provider (see the #9214 review thread). `shell` runs an
+/// configured provider, so tool output is a confidentiality boundary and
+/// not just an integrity one. `shell` runs an
 /// arbitrary subprocess whose command line is only screened by a heuristic
 /// app-layer string scan (`SecurityPolicy::forbidden_path_argument`), not
 /// the structural path-canonicalization confinement the file tools get
@@ -331,7 +332,7 @@ mod tests {
 
     #[test]
     fn live_effective_tools_denies_shell_even_when_case_and_config_both_request_it() {
-        // The exact scenario the #9214 review flagged: a case's `tools` asks
+        // The escape scenario the denylist exists for: a case's `tools` asks
         // for `shell` *and* the operator's `[eval].live_allowed_tools`
         // config (the `allowed` argument here) explicitly permits it. The
         // hard denylist must still win over both, leaving only the
