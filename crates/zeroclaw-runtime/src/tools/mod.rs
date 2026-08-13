@@ -320,9 +320,10 @@ pub fn default_tools_with_sandbox(
 
 /// Shared body for `default_tools_with_runtime` and `default_tools_with_sandbox`:
 /// builds the same registry shape (shell, file_read, deliver_file, file_write,
-/// file_edit, glob_search, content_search) behind the same `RateLimitedTool` /
-/// `PathGuardedTool` wrappers, differing only in the sandbox wrapping the shell
-/// tool.
+/// file_edit, glob_search, content_search) behind the same rate limits. The
+/// filesystem tools retain their generic path guards; the shell performs its
+/// dialect-aware path checks internally. The callers differ only in the sandbox
+/// wrapping the shell tool.
 fn default_tools_impl(
     security: Arc<SecurityPolicy>,
     runtime: Arc<dyn RuntimeAdapter>,
