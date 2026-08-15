@@ -5,7 +5,12 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// A complete LLM conversation trace loaded from a JSON fixture.
+///
+/// Unknown keys are rejected. A required, 100%-pass regression gate must not
+/// be able to certify a fixture whose expectation was silently dropped
+/// because its key was misspelled.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LlmTrace {
     /// Identifier for the trace (surfaced in reports).
     pub model_name: String,
@@ -60,7 +65,12 @@ pub struct TraceToolCall {
 }
 
 /// Declarative expectations for grading a run.
+///
+/// Unknown keys are rejected so a typoed expectation cannot degrade a case
+/// into a silent no-op. See [`TraceExpects::is_empty`] for the companion
+/// guard against a fixture that declares no expectation at all.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TraceExpects {
     /// Substrings the final response must contain.
     #[serde(default)]
@@ -85,6 +95,24 @@ pub struct TraceExpects {
     pub response_matches: Vec<String>,
 }
 
+impl TraceExpects {
+    /// True when the fixture declares no effective assertion.
+    ///
+    /// `evaluate_expects` produces one grade per declared expectation, and
+    /// `CaseReport::passed()` is vacuously true over zero grades. A case in
+    /// this state exercises the agent but certifies nothing, so a required
+    /// gate must reject it at load time rather than report it green.
+    pub fn is_empty(&self) -> bool {
+        self.response_contains.is_empty()
+            && self.response_not_contains.is_empty()
+            && self.tools_used.is_empty()
+            && self.tools_not_used.is_empty()
+            && self.max_tool_calls.is_none()
+            && self.all_tools_succeeded.is_none()
+            && self.response_matches.is_empty()
+    }
+}
+
 impl LlmTrace {
     /// Load a trace from a JSON file.
     pub fn from_file(path: &Path) -> anyhow::Result<Self> {
@@ -92,6 +120,13 @@ impl LlmTrace {
             .with_context(|| format!("reading trace fixture {}", path.display()))?;
         let trace: LlmTrace = serde_json::from_str(&content)
             .with_context(|| format!("parsing trace fixture {}", path.display()))?;
+        if trace.expects.is_empty() {
+            anyhow::bail!(
+                "trace fixture {} declares no effective expectation; a case that asserts \
+                 nothing would pass vacuously and cannot certify the required regression gate",
+                path.display()
+            );
+        }
         Ok(trace)
     }
 }
@@ -183,15 +218,120 @@ mod tests {
         assert!(t.turns.is_empty());
         assert!(t.expects.response_contains.is_empty());
         assert!(t.expects.max_tool_calls.is_none());
+        // Deserialization still tolerates the omitted field; `from_file` is
+        // the layer that refuses to admit the resulting no-op case.
+        assert!(t.expects.is_empty());
     }
 
     #[test]
     fn from_file_reads_and_parses_trace() {
         let path = std::env::temp_dir().join("zeroclaw_eval_case_from_file_test.json");
-        std::fs::write(&path, r#"{"model_name":"demo","turns":[]}"#).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"model_name":"demo","turns":[],"expects":{"response_contains":["ok"]}}"#,
+        )
+        .unwrap();
         let t = LlmTrace::from_file(&path).unwrap();
         assert_eq!(t.model_name, "demo");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn from_file_rejects_a_fixture_with_omitted_expectations() {
+        let path = std::env::temp_dir().join("zeroclaw_eval_case_omitted_expects_test.json");
+        std::fs::write(&path, r#"{"model_name":"demo","turns":[]}"#).unwrap();
+
+        let err = LlmTrace::from_file(&path)
+            .expect_err("a fixture that asserts nothing must not load into a required gate");
+
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("declares no effective expectation"),
+            "error must explain the vacuous-pass rejection, got: {rendered}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn from_file_rejects_a_fixture_with_an_empty_expects_block() {
+        let path = std::env::temp_dir().join("zeroclaw_eval_case_empty_expects_test.json");
+        std::fs::write(&path, r#"{"model_name":"demo","turns":[],"expects":{}}"#).unwrap();
+
+        let err = LlmTrace::from_file(&path)
+            .expect_err("an explicitly empty expects block asserts nothing either");
+
+        assert!(
+            format!("{err:#}").contains("declares no effective expectation"),
+            "an empty `expects` object must be rejected like an omitted one"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn from_file_rejects_a_typoed_expectation_key() {
+        // Without `deny_unknown_fields` a misspelled key is dropped in
+        // silence, leaving a case that runs the agent and grades nothing.
+        let path = std::env::temp_dir().join("zeroclaw_eval_case_typo_expects_test.json");
+        std::fs::write(
+            &path,
+            r#"{"model_name":"demo","turns":[],"expects":{"response_contain":["ok"]}}"#,
+        )
+        .unwrap();
+
+        let err = LlmTrace::from_file(&path)
+            .expect_err("a typoed expectation key must fail loudly, not degrade to a no-op");
+
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("response_contain"),
+            "error must name the offending key, got: {rendered}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn from_file_rejects_an_unknown_top_level_key() {
+        let path = std::env::temp_dir().join("zeroclaw_eval_case_typo_toplevel_test.json");
+        std::fs::write(
+            &path,
+            r#"{"model_name":"demo","turns":[],"expect":{"response_contains":["ok"]}}"#,
+        )
+        .unwrap();
+
+        let err = LlmTrace::from_file(&path)
+            .expect_err("a misspelled top-level key silently discards every expectation");
+
+        assert!(
+            format!("{err:#}").contains("expect"),
+            "error must name the offending top-level key"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn trace_expects_is_empty_is_false_for_each_individual_expectation() {
+        // Each field alone must be enough to admit the fixture, otherwise a
+        // legitimate single-assertion case would be rejected as vacuous.
+        let cases = [
+            r#"{"response_contains":["a"]}"#,
+            r#"{"response_not_contains":["a"]}"#,
+            r#"{"tools_used":["echo"]}"#,
+            r#"{"tools_not_used":["echo"]}"#,
+            r#"{"max_tool_calls":0}"#,
+            r#"{"all_tools_succeeded":false}"#,
+            r#"{"response_matches":["^a"]}"#,
+        ];
+        for raw in cases {
+            let expects: TraceExpects = serde_json::from_str(raw).unwrap();
+            assert!(
+                !expects.is_empty(),
+                "{raw} declares a real assertion and must not count as empty"
+            );
+        }
+        // `max_tool_calls: 0` is a genuine assertion (no tool may run), so it
+        // must not be confused with an absent bound.
+        let zero: TraceExpects = serde_json::from_str(r#"{"max_tool_calls":0}"#).unwrap();
+        assert_eq!(zero.max_tool_calls, Some(0));
     }
 
     #[test]
@@ -199,8 +339,16 @@ mod tests {
         let dir = std::env::temp_dir().join("zeroclaw_eval_case_suite_test");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("b.json"), r#"{"model_name":"b","turns":[]}"#).unwrap();
-        std::fs::write(dir.join("a.json"), r#"{"model_name":"a","turns":[]}"#).unwrap();
+        std::fs::write(
+            dir.join("b.json"),
+            r#"{"model_name":"b","turns":[],"expects":{"response_contains":["b"]}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("a.json"),
+            r#"{"model_name":"a","turns":[],"expects":{"response_contains":["a"]}}"#,
+        )
+        .unwrap();
         std::fs::write(dir.join("note.txt"), "ignored").unwrap();
         let suite = load_suite(&dir).unwrap();
         assert_eq!(suite.len(), 2); // the .txt file is ignored
