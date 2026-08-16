@@ -111,6 +111,29 @@ impl TraceExpects {
             && self.all_tools_succeeded.is_none()
             && self.response_matches.is_empty()
     }
+
+    /// The name of the first string-backed family holding a zero-length entry.
+    ///
+    /// A zero-length entry is admitted by [`is_empty`](Self::is_empty) because
+    /// the vector is non-empty, yet it asserts nothing: every response contains
+    /// the empty substring, the empty regex matches every response, and no tool
+    /// is ever recorded under an empty name. In the positive families that
+    /// yields a tautological pass and in `tools_not_used` a degenerate one, so
+    /// such an entry can certify the required gate green without testing any
+    /// behavior. The negative families are rejected on the same rule for a
+    /// consistent schema, even though they fail rather than falsely certify.
+    fn empty_entry_family(&self) -> Option<&'static str> {
+        [
+            ("response_contains", &self.response_contains),
+            ("response_not_contains", &self.response_not_contains),
+            ("tools_used", &self.tools_used),
+            ("tools_not_used", &self.tools_not_used),
+            ("response_matches", &self.response_matches),
+        ]
+        .into_iter()
+        .find(|(_, values)| values.iter().any(|value| value.is_empty()))
+        .map(|(name, _)| name)
+    }
 }
 
 impl LlmTrace {
@@ -125,6 +148,14 @@ impl LlmTrace {
                 "trace fixture {} declares no effective expectation; a case that asserts \
                  nothing would pass vacuously and cannot certify the required regression gate",
                 path.display()
+            );
+        }
+        if let Some(family) = trace.expects.empty_entry_family() {
+            anyhow::bail!(
+                "trace fixture {} declares a zero-length entry in `{}`; an empty value asserts \
+                 nothing and cannot certify the required regression gate",
+                path.display(),
+                family
             );
         }
         Ok(trace)
@@ -332,6 +363,53 @@ mod tests {
         // must not be confused with an absent bound.
         let zero: TraceExpects = serde_json::from_str(r#"{"max_tool_calls":0}"#).unwrap();
         assert_eq!(zero.max_tool_calls, Some(0));
+    }
+
+    #[test]
+    fn from_file_rejects_a_zero_length_entry_in_every_string_backed_family() {
+        // Each of these loads today because the vector is non-empty, yet the
+        // entry asserts nothing. `response_contains`/`response_matches`/
+        // `tools_not_used` would additionally report a passing grade, which is
+        // a false green rather than the vacuous zero-grade case above.
+        let cases = [
+            ("response_contains", r#"{"response_contains":[""]}"#),
+            ("response_matches", r#"{"response_matches":[""]}"#),
+            ("tools_not_used", r#"{"tools_not_used":[""]}"#),
+            ("response_not_contains", r#"{"response_not_contains":[""]}"#),
+            ("tools_used", r#"{"tools_used":[""]}"#),
+        ];
+
+        for (family, expects) in cases {
+            let path = std::env::temp_dir()
+                .join(format!("zeroclaw_eval_case_empty_entry_{family}_test.json"));
+            std::fs::write(
+                &path,
+                format!(r#"{{"model_name":"demo","turns":[],"expects":{expects}}}"#),
+            )
+            .unwrap();
+
+            let err = LlmTrace::from_file(&path)
+                .expect_err("a zero-length entry must not load into a required gate");
+            let rendered = format!("{err:#}");
+            assert!(
+                rendered.contains("declares a zero-length entry"),
+                "error must explain the zero-length rejection, got: {rendered}"
+            );
+            assert!(
+                rendered.contains(family),
+                "error must name the offending family {family}, got: {rendered}"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    #[test]
+    fn trace_expects_keeps_non_empty_entries_admissible() {
+        let expects: TraceExpects = serde_json::from_str(
+            r#"{"response_contains":["ok"],"tools_not_used":["shell"],"response_matches":["^o"]}"#,
+        )
+        .unwrap();
+        assert!(expects.empty_entry_family().is_none());
     }
 
     #[test]
