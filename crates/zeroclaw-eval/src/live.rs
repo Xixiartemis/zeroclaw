@@ -21,6 +21,12 @@ use crate::observer::RecordingObserver;
 use crate::record::RunRecord;
 use crate::runner::{CaseProvider, RunDeps};
 
+/// The model name `Agent::builder()` falls back to when no `model_name` is set.
+///
+/// Mirrors the runtime builder default so the capability probe below asks the
+/// provider about the same string the agent will really dispatch with.
+const UNCONFIGURED_MODEL: &str = "<unconfigured>";
+
 /// Tools that must never reach the live-mode tool surface, no matter what a
 /// case's `tools` or `[eval].live_allowed_tools` request. Checked in
 /// [`effective_live_tools`] *after* the allowlist intersection, so deny
@@ -239,8 +245,17 @@ pub async fn run_live_case(trace: &LlmTrace, deps: &RunDeps) -> anyhow::Result<R
     } = (deps.provider)(trace)?;
     // Resolve the dispatcher from the provider's capabilities so XML-dialect
     // providers work; a default agent config routes purely by capability.
-    let dispatcher =
-        tool_dispatcher_for_provider(&AliasedAgentConfig::default(), provider.as_ref());
+    // `capabilities_for_model` is model-aware (a composite/routing provider can
+    // report different capabilities per model), so it must be asked about the
+    // same model the built agent will actually dispatch with: `model_name` when
+    // the case provider supplied one, otherwise the `Agent::builder()` default
+    // applied below.
+    let dispatcher_model = model_name.as_deref().unwrap_or(UNCONFIGURED_MODEL);
+    let dispatcher = tool_dispatcher_for_provider(
+        &AliasedAgentConfig::default(),
+        provider.as_ref(),
+        dispatcher_model,
+    );
 
     let mut builder = Agent::builder()
         .model_provider(provider)
