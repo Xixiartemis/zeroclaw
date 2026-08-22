@@ -65,7 +65,7 @@ const LIVE_TOOL_DENYLIST: &[&str] = &["shell"];
 
 /// Intersect a case's requested tools with the config allowlist, preserving the
 /// allowlist's order and de-duplicating, then drop anything in
-/// [`LIVE_TOOL_DENYLIST`]. Deny always wins: a tool present in both a case's
+/// `LIVE_TOOL_DENYLIST`. Deny always wins: a tool present in both a case's
 /// `tools` and `[eval].live_allowed_tools` is still excluded when
 /// denylisted. An empty allowlist yields no tools.
 pub fn effective_live_tools(requested: Option<&[String]>, allowed: &[String]) -> Vec<String> {
@@ -145,7 +145,7 @@ fn live_tool_registry(
 /// Resolve the OS sandbox backend that will confine the live shell tool's
 /// subprocesses to `workspace` (plus each backend's fixed system-temp
 /// allowance; see the threat-model doc). Fails closed via
-/// [`ensure_real_sandbox`] if no real backend is available on this platform.
+/// `ensure_real_sandbox` if no real backend is available on this platform.
 pub fn live_shell_sandbox(workspace: &Path) -> anyhow::Result<Arc<dyn Sandbox>> {
     let sandbox = zeroclaw_runtime::security::create_sandbox(
         &SandboxConfig {
