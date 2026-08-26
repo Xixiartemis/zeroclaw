@@ -960,9 +960,9 @@ mod tests {
             "gateway router must keep optional_channel_routes as the channel webhook route owner",
         );
         let end = source[start..]
-            .find("/// Webhook request body")
+            .find("fn sop_webhook_routes(")
             .map(|offset| start + offset)
-            .expect("marker after optional_channel_routes moved; update this drift guard");
+            .expect("route owner after optional_channel_routes moved; update this drift guard");
         let region = &source[start..end];
 
         let all_routes = parse_routes(region);
