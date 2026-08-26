@@ -11744,18 +11744,9 @@ mod tests {
         );
 
         // Chat never checks for ACP session history, so the very next request
-        // must be the todotracker config fetch `start_session` fires directly
-        // — never a `session/list_acp` request, and never a detour through
-        // the agent picker.
-        let request = next_rpc_request(
-            &mut rx,
-            "Chat single-agent start should load todotracker config",
-        )
-        .await;
-        assert_eq!(request["method"], method::CONFIG_LIST);
-        assert_eq!(request["params"]["prefix"], "todotracker");
-        respond_ok(&rpc, &request, serde_json::json!([]));
-
+        // must mint the session directly — never a `session/list_acp` request
+        // and never a detour through the agent picker. TodoTracker settings are
+        // resolved from the local ZeroCode config before this RPC boundary.
         let request = next_rpc_request(
             &mut rx,
             "Chat single-agent start should mint a fresh session",
