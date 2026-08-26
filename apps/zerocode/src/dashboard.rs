@@ -3253,7 +3253,6 @@ mod tests {
             config_file: Some("/tmp/zc-profile/config.toml".into()),
             config_kind: Some("temporary".into()),
             local_ipc_endpoint: Some("/tmp/zc-profile/data/daemon.sock".into()),
-            shell_profile: None,
         }
     }
 
