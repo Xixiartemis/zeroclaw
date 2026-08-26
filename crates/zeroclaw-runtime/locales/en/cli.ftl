@@ -179,6 +179,7 @@ cli-sop-validate-about = Validate SOP definitions
 cli-sop-show-about = Show details of an SOP
 
 cli-migrate-openclaw-about = Import memory from an OpenClaw workspace into this ZeroClaw workspace
+cli-migrate-openclaw-qdrant-unsupported = Qdrant is not currently supported as an OpenClaw migration target. Set memory.backend to sqlite, lucid, or markdown and retry.
 
 cli-agent-long-about =
     Start the AI agent loop.
@@ -506,6 +507,7 @@ cli-sop-none = No SOPs found.
 cli-sop-pending-none = No SOP runs waiting for approval.
 cli-sop-pending-header = SOP runs waiting for approval:
 cli-sop-pending-row = {"  "}{$run_id} [{$sop_name}] step {$step}/{$total}
+cli-sop-status-failure-reason = Failure reason: {$reason}
 # gateway WebSocket SOP approval error frames (UI-surfaced)
 cli-sop-ws-invalid-approval = sop approval_response requires run_id and a decision of approve or deny
 cli-sop-ws-resolve-failed = sop resolve failed: {$error}
@@ -687,6 +689,7 @@ cli-quickstart-error-channel-required = channel type and alias are required
 cli-quickstart-error-channel-field-not-advertised = channel field `{$field}` is not available in Quickstart
 cli-quickstart-error-channel-token-required = Telegram bot token is required
 cli-quickstart-error-webhook-secret-required = Webhook shared secret is required
+cli-quickstart-error-webhook-port-conflict = webhook port {$port} is already used by enabled webhook `{$alias}` — each enabled webhook needs its own port
 cli-quickstart-error-peer-group-name-required = peer-group name is required
 cli-quickstart-error-peer-group-channel-required = peer-group channel ref is required
 cli-quickstart-error-peer-group-unknown-channel = peer-group `{$name}` references unknown channel `{$channel}`
@@ -1117,6 +1120,7 @@ cli-doctor-probe-timeout-message = Model probing timed out. Some provider catalo
 # ── Degraded config sections (doctor diagnose, #8835) ──
 cli-doctor-degraded-security = SECURITY-CRITICAL config section `{$path}` is invalid and was reset to its default so the daemon can boot; the running posture may be WEAKER than intended. Run `zeroclaw config migrate` to see the parse error, then repair the file.
 cli-doctor-degraded-section = config section `{$path}` is malformed and was reset to defaults; values in that section are NOT in effect. Run `zeroclaw config migrate` to see the parse error, then repair the file.
+cli-doctor-verifiable-intent-tool-withheld = verifiable_intent.enabled is set, but the vi_verify tool is withheld from the model-visible registry until a credential chain verifier exists. Enabling the section does not enable credential verification on commerce tool calls. The issuance and verification library paths are unaffected.
 sop-approval-deferred-at-capacity = Approval could not resume run {$run_id}: execution slots are full. The gate remains waiting; retry after a slot frees.
 sop-approval-policy-unavailable = Approval failed because the parked SOP step is unavailable: {$reason}. The run remains waiting.
 sop-rpc-decision-invalid-state = Run {$run_id} cannot be resolved in its current state.

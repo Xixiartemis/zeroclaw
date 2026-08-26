@@ -5,8 +5,8 @@ use crate::PluginCapability;
 use crate::component::bindings::tool::ToolPlugin;
 use crate::component::bindings::tool::exports::zeroclaw::plugin::tool::ToolResult as WitToolResult;
 use crate::component::{
-    PluginState, PluginStoreSpec, WarmPluginState, call_plugin, call_plugin_with_secrets,
-    call_store, engine, load_component, wt, wt_instantiate,
+    PluginState, PluginStoreSpec, WarmPluginState, call_plugin, call_store, call_tool_execute,
+    engine, load_component, wt, wt_instantiate,
 };
 use crate::instance::PluginInstanceScope;
 use crate::services::PluginHostServices;
@@ -147,7 +147,7 @@ pub async fn call_tool_metadata(plugin: &mut Plugin) -> Result<ToolMetadata> {
 
 /// Invoke the exported tool's `execute`, injecting its non-secret resolved config.
 pub async fn call_execute(plugin: &mut Plugin, args_json: &[u8]) -> Result<ToolResult> {
-    call_plugin_with_secrets!(
+    call_tool_execute!(
         plugin,
         async move |store: &mut Store<PluginState>, bindings: &mut ToolPlugin| {
             let config = store.data_mut().public_config()?;
