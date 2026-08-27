@@ -4,7 +4,7 @@
 
 use async_trait::async_trait;
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
 use zeroclaw_api::model_provider::{
     ChatRequest, ChatResponse, ModelProvider, ProviderCapabilities, TokenUsage, ToolCall,
@@ -31,6 +31,13 @@ struct ReplayState {
 /// queues. Requesting more responses than the trace scripts *for the current turn*
 /// is an error (exhaustion guard), as is leaving any scripted for it unconsumed
 /// (over-specification guard, see [`ReplayHandle::finish_turn`]).
+
+fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
 pub struct TraceLlmProvider {
     state: Arc<Mutex<ReplayState>>,
     trace_name: String,
@@ -88,7 +95,7 @@ impl ReplayHandle {
     /// the cursor to the next turn. Errors if any steps were left unconsumed, so an
     /// over-specified turn fails the case instead of leaking into the next one.
     pub fn finish_turn(&self, turn_index: usize) -> anyhow::Result<()> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = lock_recover(&self.state);
         let current = state.current;
         let leftover = state.turns.get(current).map_or(0, |q| q.len());
         anyhow::ensure!(
@@ -141,7 +148,7 @@ impl ModelProvider for TraceLlmProvider {
         _temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
         let step = {
-            let mut state = self.state.lock().unwrap();
+            let mut state = lock_recover(&self.state);
             let current = state.current;
             match state.turns.get_mut(current).and_then(|q| q.pop_front()) {
                 Some(step) => step,
