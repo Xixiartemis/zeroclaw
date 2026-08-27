@@ -379,7 +379,7 @@ fn build_run_deps(config: &Config, mode: Mode) -> Result<RunDeps> {
                 provider: Box::new(move |_trace: &LlmTrace| {
                     let (provider, _provider_type, _resolved_model) =
                         build_session_model_provider(&cfg, &provider_ref, None)?;
-                    Ok(provider)
+                    Ok(zeroclaw_eval::runner::ProviderSetup::new(provider))
                 }),
                 provider_ref: receipt_ref,
                 live_tools: config.eval.live_allowed_tools.clone(),
