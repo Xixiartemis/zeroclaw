@@ -15,6 +15,7 @@ use crate::case::{LlmTrace, load_suite};
 use crate::grader::{GradeResult, grade_run};
 use crate::observer::RecordingObserver;
 use crate::record::RunRecord;
+use crate::replay::ReplayHandle;
 use crate::report::{CaseReport, SuiteReport};
 use crate::tools::default_tools;
 
@@ -29,8 +30,23 @@ pub struct CaseOutcome {
 
 /// Factory that builds a fresh model provider for one case run. Injected so
 /// replay, live, and deterministic tests share one runner code path.
-pub type ProviderFactory =
-    Box<dyn Fn(&LlmTrace) -> anyhow::Result<Box<dyn ModelProvider>> + Send + Sync>;
+pub type ProviderFactory = Box<dyn Fn(&LlmTrace) -> anyhow::Result<CaseProvider> + Send + Sync>;
+
+/// A provider for one case plus the replay handle that owns its turn boundary.
+pub struct CaseProvider {
+    pub provider: Box<dyn ModelProvider>,
+    pub replay: Option<ReplayHandle>,
+}
+
+impl CaseProvider {
+    /// Build a provider without a scripted replay boundary, as used by live mode.
+    pub fn plain(provider: Box<dyn ModelProvider>) -> Self {
+        Self {
+            provider,
+            replay: None,
+        }
+    }
+}
 
 /// Everything a case run needs that differs between replay, live, and tests.
 ///
@@ -55,10 +71,12 @@ impl RunDeps {
         Self {
             mode: Mode::Replay,
             provider: Box::new(|trace| {
-                Ok(
-                    Box::new(crate::replay::TraceLlmProvider::try_from_trace(trace)?)
-                        as Box<dyn ModelProvider>,
-                )
+                let replay = crate::replay::TraceLlmProvider::try_from_trace(trace)?;
+                let handle = replay.handle();
+                Ok(CaseProvider {
+                    provider: Box::new(replay) as Box<dyn ModelProvider>,
+                    replay: Some(handle),
+                })
             }),
             provider_ref: "scripted".to_string(),
             live_tools: Vec::new(),
@@ -139,7 +157,10 @@ async fn run_replay_case(trace: &LlmTrace, deps: &RunDeps) -> anyhow::Result<Cas
     let memory: Arc<dyn Memory> = Arc::from(create_memory(&mem_cfg, tmp.path(), None)?);
 
     let observer = Arc::new(RecordingObserver::new());
-    let provider = (deps.provider)(trace)?;
+    let CaseProvider {
+        provider,
+        replay: replay_handle,
+    } = (deps.provider)(trace)?;
 
     let mut agent = Agent::builder()
         .model_provider(provider)
@@ -152,8 +173,11 @@ async fn run_replay_case(trace: &LlmTrace, deps: &RunDeps) -> anyhow::Result<Cas
 
     let start = std::time::Instant::now();
     let mut final_response = String::new();
-    for turn in &trace.turns {
+    for (turn_index, turn) in trace.turns.iter().enumerate() {
         final_response = agent.turn(&turn.user_input).await?;
+        if let Some(handle) = &replay_handle {
+            handle.finish_turn(turn_index)?;
+        }
     }
     let duration_ms = start.elapsed().as_millis() as u64;
 
