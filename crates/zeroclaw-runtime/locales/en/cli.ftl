@@ -1141,6 +1141,7 @@ cli-eval-comparison-regression = REGRESSION ({$categories})
 cli-eval-comparison-unchanged-tokens = unchanged (tokens {$pct}%)
 cli-eval-comparison-unchanged = unchanged
 cli-eval-judge-gate-diagnostic =   warning: [eval].judge_gate is set but judge grades stay diagnostic: {$reason}
+cli-eval-self-judge-warning =   warning: judge and live provider are the same provider reference (self-judging bias)
 # ── Runtime command construction — shell and skill shell tools ──
 tool-runtime-command-build-failed = Failed to build runtime command: {$error}
 tool-runtime-command-docker-workspace-path = Failed to build runtime command: Failed to canonicalize Docker workspace path {$path}: {$cause}

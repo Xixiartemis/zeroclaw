@@ -204,9 +204,7 @@ fn build_run_deps(config: &Config, mode: Mode) -> Result<RunDeps> {
                 .as_ref()
                 .is_some_and(|j| j.judge_ref.split(':').next() == Some(provider_ref.as_str()))
             {
-                println!(
-                    "  warning: judge and live provider are the same provider reference (self-judging bias)"
-                );
+                eprintln!("{}", get_required_cli_string("cli-eval-self-judge-warning"));
             }
             let cfg = config.clone();
             RunDeps {
