@@ -123,12 +123,18 @@ pub async fn run_live_case(
     let observer = Arc::new(RecordingObserver::new());
     let provider = (deps.provider)(trace)?.provider;
     // Resolve the dispatcher from the provider's capabilities so XML-dialect
-    // providers work; a default agent config routes purely by capability.
-    let dispatcher =
-        tool_dispatcher_for_provider(&AliasedAgentConfig::default(), provider.as_ref());
+    // providers work; a default agent config routes purely by capability. Keep
+    // the dispatcher probe and agent request on the same explicit model value.
+    let model_name = "<unconfigured>";
+    let dispatcher = tool_dispatcher_for_provider(
+        &AliasedAgentConfig::default(),
+        provider.as_ref(),
+        model_name,
+    );
 
     let mut agent = Agent::builder()
         .model_provider(provider)
+        .model_name(model_name.to_string())
         .tools(tools)
         .memory(memory)
         .observer(observer.clone())
