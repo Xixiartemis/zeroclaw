@@ -1,6 +1,6 @@
 //! An [`Observer`] that records tool-call outcomes and token usage from a run.
 
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use zeroclaw_api::observability_traits::{Observer, ObserverEvent, ObserverMetric};
 
 /// One dispatched tool call as observed at the dispatch boundary.
@@ -31,6 +31,13 @@ pub struct RecordingObserver {
     output_tokens: Mutex<u64>,
 }
 
+fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
 impl RecordingObserver {
     pub fn new() -> Self {
         Self::default()
@@ -38,14 +45,12 @@ impl RecordingObserver {
 
     /// Every dispatched tool call, in call order, with arguments and results.
     pub fn calls(&self) -> Vec<RecordedCall> {
-        self.tool_calls.lock().unwrap().clone()
+        lock_recover(&self.tool_calls).clone()
     }
 
     /// Names of tools that were dispatched, in call order.
     pub fn tool_names(&self) -> Vec<String> {
-        self.tool_calls
-            .lock()
-            .unwrap()
+        lock_recover(&self.tool_calls)
             .iter()
             .map(|c| c.name.clone())
             .collect()
@@ -53,14 +58,14 @@ impl RecordingObserver {
 
     /// True when every dispatched tool call reported success (vacuously true if none).
     pub fn all_tools_succeeded(&self) -> bool {
-        self.tool_calls.lock().unwrap().iter().all(|c| c.success)
+        lock_recover(&self.tool_calls).iter().all(|c| c.success)
     }
 
     /// Accumulated `(input_tokens, output_tokens)` reported by the provider.
     pub fn tokens(&self) -> (u64, u64) {
         (
-            *self.input_tokens.lock().unwrap(),
-            *self.output_tokens.lock().unwrap(),
+            *lock_recover(&self.input_tokens),
+            *lock_recover(&self.output_tokens),
         )
     }
 }
@@ -75,7 +80,7 @@ impl Observer for RecordingObserver {
                 result,
                 ..
             } => {
-                self.tool_calls.lock().unwrap().push(RecordedCall {
+                lock_recover(&self.tool_calls).push(RecordedCall {
                     name: tool.clone(),
                     arguments: arguments.clone().unwrap_or_default(),
                     result: result.clone().unwrap_or_default(),
@@ -88,10 +93,10 @@ impl Observer for RecordingObserver {
                 ..
             } => {
                 if let Some(i) = input_tokens {
-                    *self.input_tokens.lock().unwrap() += i;
+                    *lock_recover(&self.input_tokens) += i;
                 }
                 if let Some(o) = output_tokens {
-                    *self.output_tokens.lock().unwrap() += o;
+                    *lock_recover(&self.output_tokens) += o;
                 }
             }
             _ => {}
