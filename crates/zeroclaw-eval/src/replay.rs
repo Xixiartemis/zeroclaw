@@ -19,6 +19,13 @@ struct ReplayState {
     current: usize,
 }
 
+fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
 /// Replays a trace's scripted steps with the turn boundary preserved.
 ///
 /// Each turn keeps its own FIFO queue and `chat()` pops only from the queue of the
@@ -26,13 +33,6 @@ struct ReplayState {
 /// scripted responses. Requesting more responses than the *current turn* scripts is
 /// an error (exhaustion guard); leaving a turn's steps unconsumed is caught by
 /// [`ReplayHandle::finish_turn`], which the runner calls at every turn boundary.
-
-fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    match mutex.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    }
-}
 pub struct TraceLlmProvider {
     state: Arc<Mutex<ReplayState>>,
     trace_name: String,
