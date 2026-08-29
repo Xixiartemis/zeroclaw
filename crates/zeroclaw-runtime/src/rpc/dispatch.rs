@@ -1448,6 +1448,17 @@ impl RpcDispatcher {
 
     async fn handle_session_close(&self, params: &Value) -> RpcResult {
         let req: SessionIdParams = parse_params(params)?;
+        // Cancellation must be signalled before waiting: the admitted prompt
+        // owns this permit until its terminal state and transcript writes are
+        // complete. Removal then happens under the same incarnation fence.
+        self.ctx.sessions.signal_session_removal(&req.session_id);
+        let _guard = self
+            .ctx
+            .sessions
+            .session_queue
+            .acquire(&req.session_id)
+            .await
+            .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
         if let Some(agent) = self.ctx.sessions.get_agent(&req.session_id).await {
             agent
                 .lock()
@@ -1516,6 +1527,18 @@ impl RpcDispatcher {
     async fn handle_session_kill(&self, params: &Value) -> RpcResult {
         let req: SessionKillParams = parse_params(params)?;
         let sid = &req.session_id;
+
+        // Preserve kill semantics by signalling the admitted prompt first,
+        // then wait for its finalization before reading mode or tombstoning
+        // and removing this exact session incarnation.
+        self.ctx.sessions.signal_session_kill(sid);
+        let _guard = self
+            .ctx
+            .sessions
+            .session_queue
+            .acquire(sid)
+            .await
+            .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
 
         let chat_mode = self
             .ctx
@@ -2559,6 +2582,14 @@ impl RpcDispatcher {
 
     async fn handle_session_delete(&self, params: &Value) -> RpcResult {
         let req: SessionIdParams = parse_params(params)?;
+        self.ctx.sessions.signal_session_removal(&req.session_id);
+        let _guard = self
+            .ctx
+            .sessions
+            .session_queue
+            .acquire(&req.session_id)
+            .await
+            .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
         if let Some(agent) = self.ctx.sessions.get_agent(&req.session_id).await {
             agent
                 .lock()
@@ -11645,5 +11676,160 @@ mod tests {
             chat_backend.load(&key).is_empty(),
             "the finalized ACP prompt must not append into the replacement Chat transcript"
         );
+    }
+
+    #[tokio::test]
+    async fn session_removals_wait_for_prompt_finalization_before_same_id_reuse() {
+        #[derive(Clone, Copy, Debug)]
+        enum Removal {
+            Close,
+            Kill,
+            Delete,
+        }
+
+        for removal in [Removal::Close, Removal::Kill, Removal::Delete] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = make_acp_test_config(&tmp);
+            let data_dir = config.data_dir.clone();
+            let (dispatcher, sessions, chat_backend, acp_store) =
+                make_persistence_test_dispatcher(config, &data_dir);
+
+            let sid = format!("acp-removal-{removal:?}").to_ascii_lowercase();
+            acp_store
+                .create_session(&sid, "test-agent", tmp.path().to_str().unwrap())
+                .unwrap();
+            let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+            let agent = crate::agent::agent::Agent::builder()
+                .model_provider(Box::new(GatedProvider {
+                    started: started_tx,
+                    release: tokio::sync::Mutex::new(Some(release_rx)),
+                }))
+                .tools(vec![])
+                .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+                .observer(Arc::new(crate::observability::noop::NoopObserver))
+                .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+                .workspace_dir(tmp.path().to_path_buf())
+                .agent_alias("test-agent".to_string())
+                .build()
+                .expect("test agent should build");
+            sessions
+                .insert(
+                    sid.clone(),
+                    crate::rpc::session::RpcSession::new(
+                        agent,
+                        "test-agent",
+                        tmp.path().to_str().unwrap(),
+                        crate::rpc::types::ChatMode::Acp,
+                    ),
+                )
+                .await
+                .unwrap();
+
+            // Hold admission so both operations queue deterministically. The
+            // prompt registers first; the removal must remain behind it until
+            // that ACP incarnation has finalized all durable work.
+            let admission_guard = sessions.session_queue.acquire(&sid).await.unwrap();
+            let prompt_handle = dispatcher.spawn_handle();
+            let sid_for_prompt = sid.clone();
+            let prompt_task = zeroclaw_spawn::spawn!(async move {
+                prompt_handle
+                    .handle_session_prompt(&json!({
+                        "session_id": sid_for_prompt,
+                        "prompt": "blocked ACP turn",
+                    }))
+                    .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while sessions.session_queue.queue_depth(&sid).await < 2 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("prompt must register behind the test admission guard");
+
+            let removal_handle = dispatcher.spawn_handle();
+            let sid_for_removal = sid.clone();
+            let removal_task = zeroclaw_spawn::spawn!(async move {
+                match removal {
+                    Removal::Close => {
+                        removal_handle
+                            .handle_session_close(&json!({"session_id": sid_for_removal}))
+                            .await
+                    }
+                    Removal::Kill => {
+                        removal_handle
+                            .handle_session_kill(&json!({"session_id": sid_for_removal}))
+                            .await
+                    }
+                    Removal::Delete => {
+                        removal_handle
+                            .handle_session_delete(&json!({"session_id": sid_for_removal}))
+                            .await
+                    }
+                }
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while sessions.session_queue.queue_depth(&sid).await < 3 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("removal must register behind the admitted prompt");
+            assert!(
+                !removal_task.is_finished(),
+                "{removal:?} must not remove an incarnation that still owns admission"
+            );
+            assert_eq!(
+                sessions.chat_mode(&sid).await,
+                Some(crate::rpc::types::ChatMode::Acp)
+            );
+
+            drop(admission_guard);
+            started_rx
+                .recv()
+                .await
+                .expect("the queued ACP prompt must run before removal");
+            assert!(
+                !removal_task.is_finished(),
+                "{removal:?} must wait while the ACP provider is blocked"
+            );
+            release_tx.send(()).unwrap();
+
+            let prompt_result = prompt_task.await.expect("prompt task must not panic");
+            assert!(
+                prompt_result.is_ok(),
+                "ACP prompt should finalize before {removal:?}: {prompt_result:?}"
+            );
+            let removal_result = removal_task.await.expect("removal task must not panic");
+            assert!(
+                removal_result.is_ok(),
+                "{removal:?} should succeed after prompt finalization: {removal_result:?}"
+            );
+            assert!(sessions.chat_mode(&sid).await.is_none());
+
+            let replacement = dispatcher
+                .handle_session_new_for_test(&json!({
+                    "agent_alias": "test-agent",
+                    "session_id": sid,
+                    "chat_mode": "chat",
+                }))
+                .await;
+            assert!(
+                replacement.is_ok(),
+                "same-ID Chat replacement should succeed after {removal:?}: {replacement:?}"
+            );
+            let key = format!("rpc_{sid}");
+            let replacement_state = chat_backend
+                .get_session_state(&key)
+                .unwrap()
+                .expect("Chat replacement must own a fresh durable row");
+            assert_eq!(replacement_state.state, "idle");
+            assert!(replacement_state.turn_id.is_none());
+            assert!(
+                chat_backend.load(&key).is_empty(),
+                "old ACP turn must not contaminate Chat transcript after {removal:?}"
+            );
+        }
     }
 }

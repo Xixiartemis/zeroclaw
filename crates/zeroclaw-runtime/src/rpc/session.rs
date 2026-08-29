@@ -479,13 +479,29 @@ impl SessionStore {
     }
 
     pub fn cancel_session(&self, id: &str) -> bool {
-        self.record_cancel_cause(id, CancelCause::ClientRpc);
-        self.cancel_tokens
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        self.signal_cancellation(id, CancelCause::ClientRpc)
+    }
+
+    /// Signal an in-flight turn before a close/delete handler waits for the
+    /// session admission permit. The handler removes the session only after
+    /// the admitted prompt has finalized under its original incarnation.
+    pub fn signal_session_removal(&self, id: &str) -> bool {
+        self.signal_cancellation(id, CancelCause::SessionRemoved)
+    }
+
+    /// Signal an in-flight turn before an administrative kill waits for the
+    /// session admission permit.
+    pub fn signal_session_kill(&self, id: &str) -> bool {
+        self.signal_cancellation(id, CancelCause::AdminKill)
+    }
+
+    fn signal_cancellation(&self, id: &str, cause: CancelCause) -> bool {
+        let tokens = self.cancel_tokens.lock().unwrap_or_else(|e| e.into_inner());
+        tokens
             .get(id)
-            .map(|(_, t)| {
-                t.cancel();
+            .map(|(_, token)| {
+                self.record_cancel_cause(id, cause);
+                token.cancel();
                 true
             })
             .unwrap_or(false)
