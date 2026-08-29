@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -59,6 +60,8 @@ enum QuickstartChatDrain {
 const TICK: Duration = Duration::from_millis(200);
 const CHROME_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_COALESCED_MOUSE_DRAGS: usize = 64;
+const SPLIT_SGR_MOUSE_GRACE: Duration = Duration::from_millis(30);
+const MAX_SPLIT_SGR_MOUSE_CHARS: usize = 32;
 
 /// Returns whether an application-level confirmation modal owns an input event.
 ///
@@ -99,6 +102,139 @@ where
         }
     }
     Ok((current, None))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SplitSgrMouseParse {
+    Incomplete,
+    Complete(crossterm::event::MouseEvent),
+    Invalid,
+}
+
+fn split_sgr_key_char(event: &Event) -> Option<char> {
+    let Event::Key(key) = event else {
+        return None;
+    };
+    if key.kind == KeyEventKind::Release
+        || key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char(c) if c.is_ascii() => Some(c),
+        _ => None,
+    }
+}
+
+fn parse_split_sgr_wheel(sequence: &str) -> SplitSgrMouseParse {
+    if sequence.is_empty() || sequence == "[" || sequence == "[<" {
+        return SplitSgrMouseParse::Incomplete;
+    }
+    if !sequence.starts_with("[<") {
+        return SplitSgrMouseParse::Invalid;
+    }
+
+    let payload = &sequence[2..];
+    let Some(last) = payload.chars().last() else {
+        return SplitSgrMouseParse::Incomplete;
+    };
+    if last != 'M' && last != 'm' {
+        return if payload.chars().all(|c| c.is_ascii_digit() || c == ';')
+            && payload.matches(';').count() <= 3
+        {
+            SplitSgrMouseParse::Incomplete
+        } else {
+            SplitSgrMouseParse::Invalid
+        };
+    }
+
+    let fields_payload = &payload[..payload.len() - 1];
+    let fields_payload = fields_payload.strip_suffix(';').unwrap_or(fields_payload);
+    let fields: Vec<_> = fields_payload.split(';').collect();
+    if fields.len() != 3 || fields.iter().any(|field| field.is_empty()) {
+        return SplitSgrMouseParse::Invalid;
+    }
+    let Ok(cb) = fields[0].parse::<u8>() else {
+        return SplitSgrMouseParse::Invalid;
+    };
+    let Ok(column) = fields[1].parse::<u16>() else {
+        return SplitSgrMouseParse::Invalid;
+    };
+    let Ok(row) = fields[2].parse::<u16>() else {
+        return SplitSgrMouseParse::Invalid;
+    };
+    let Some(column) = column.checked_sub(1) else {
+        return SplitSgrMouseParse::Invalid;
+    };
+    let Some(row) = row.checked_sub(1) else {
+        return SplitSgrMouseParse::Invalid;
+    };
+
+    let button_number = (cb & 0b0000_0011) | ((cb & 0b1100_0000) >> 4);
+    let dragging = cb & 0b0010_0000 != 0;
+    let kind = match (button_number, dragging) {
+        (4, false) => MouseEventKind::ScrollUp,
+        (5, false) => MouseEventKind::ScrollDown,
+        _ => return SplitSgrMouseParse::Invalid,
+    };
+    let mut modifiers = KeyModifiers::empty();
+    if cb & 0b0000_0100 != 0 {
+        modifiers |= KeyModifiers::SHIFT;
+    }
+    if cb & 0b0000_1000 != 0 {
+        modifiers |= KeyModifiers::ALT;
+    }
+    if cb & 0b0001_0000 != 0 {
+        modifiers |= KeyModifiers::CONTROL;
+    }
+
+    SplitSgrMouseParse::Complete(crossterm::event::MouseEvent {
+        kind,
+        column,
+        row,
+        modifiers,
+    })
+}
+
+fn recover_split_sgr_mouse<F>(first: Event, mut read_next: F) -> Result<(Event, VecDeque<Event>)>
+where
+    F: FnMut(Duration) -> Result<Option<Event>>,
+{
+    if !matches!(first, Event::Key(KeyEvent { code: KeyCode::Esc, kind, .. }) if kind != KeyEventKind::Release)
+    {
+        return Ok((first, VecDeque::new()));
+    }
+
+    let mut replay = VecDeque::from([first.clone()]);
+    let mut sequence = String::new();
+    let deadline = Instant::now() + SPLIT_SGR_MOUSE_GRACE;
+
+    while sequence.len() < MAX_SPLIT_SGR_MOUSE_CHARS {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            break;
+        };
+        let Some(next) = read_next(remaining)? else {
+            break;
+        };
+        let Some(c) = split_sgr_key_char(&next) else {
+            replay.push_back(next);
+            break;
+        };
+        replay.push_back(next);
+        sequence.push(c);
+        match parse_split_sgr_wheel(&sequence) {
+            SplitSgrMouseParse::Incomplete => {}
+            SplitSgrMouseParse::Complete(mouse) => {
+                return Ok((Event::Mouse(mouse), VecDeque::new()));
+            }
+            SplitSgrMouseParse::Invalid => break,
+        }
+    }
+
+    let first = replay.pop_front().expect("replay always contains Escape");
+    Ok((first, replay))
 }
 
 /// Ephemeral interaction state for the keybinding overlay. Keybinding
@@ -474,7 +610,7 @@ pub async fn run(
     )?;
     let mut chrome_status = ChromeStatus::default();
     chrome_status.tick(&rpc);
-    let mut pending_event = None;
+    let mut pending_events = VecDeque::new();
 
     loop {
         // Draw
@@ -693,7 +829,7 @@ pub async fn run(
             }
         }
 
-        let input_event = if let Some(pending) = pending_event.take() {
+        let input_event = if let Some(pending) = pending_events.pop_front() {
             pending
         } else {
             // Poll for input with a timeout so live panes refresh periodically.
@@ -724,14 +860,27 @@ pub async fn run(
             }
             event::read()?
         };
+        let (input_event, replay) = recover_split_sgr_mouse(input_event, |wait| {
+            if event::poll(wait)? {
+                Ok(Some(event::read()?))
+            } else {
+                Ok(None)
+            }
+        })?;
+        pending_events.extend(replay);
         let (input_event, next_pending) = coalesce_mouse_drag(input_event, || {
+            if let Some(pending) = pending_events.pop_front() {
+                return Ok(Some(pending));
+            }
             if event::poll(Duration::ZERO)? {
                 Ok(Some(event::read()?))
             } else {
                 Ok(None)
             }
         })?;
-        pending_event = next_pending;
+        if let Some(next_pending) = next_pending {
+            pending_events.push_front(next_pending);
+        }
 
         if confirmation_modal_owns_event(&input_event, reload_confirm, quit_confirm) {
             // The visible confirmation modal is the authoritative input
@@ -1851,6 +2000,141 @@ mod tests {
             row,
             modifiers: KeyModifiers::NONE,
         })
+    }
+
+    fn key_event(code: KeyCode) -> Event {
+        Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    fn split_sgr_events(sequence: &str) -> VecDeque<Event> {
+        sequence
+            .chars()
+            .map(|c| key_event(KeyCode::Char(c)))
+            .collect()
+    }
+
+    #[test]
+    fn split_sgr_recovers_wheel_report_as_mouse_input() {
+        let mut queued = split_sgr_events("[<64;32;17M");
+
+        let (event, replay) =
+            recover_split_sgr_mouse(key_event(KeyCode::Esc), |_| Ok(queued.pop_front()))
+                .expect("recover split SGR mouse report");
+
+        assert_eq!(event, mouse_event(MouseEventKind::ScrollUp, 31, 16));
+        assert!(replay.is_empty());
+        assert!(queued.is_empty());
+    }
+
+    #[test]
+    fn split_sgr_recovers_wheel_modifiers_and_coordinates() {
+        let mut queued = split_sgr_events("[<93;1;2M");
+
+        let (event, replay) =
+            recover_split_sgr_mouse(key_event(KeyCode::Esc), |_| Ok(queued.pop_front()))
+                .expect("recover modified split SGR mouse report");
+
+        assert_eq!(
+            event,
+            Event::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 0,
+                row: 1,
+                modifiers: KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL,
+            })
+        );
+        assert!(replay.is_empty());
+    }
+
+    #[test]
+    fn split_sgr_accepts_optional_delimiter_before_either_terminator() {
+        for (sequence, kind) in [
+            ("[<64;32;17;M", MouseEventKind::ScrollUp),
+            ("[<65;32;17;m", MouseEventKind::ScrollDown),
+        ] {
+            let mut queued = split_sgr_events(sequence);
+
+            let (event, replay) =
+                recover_split_sgr_mouse(key_event(KeyCode::Esc), |_| Ok(queued.pop_front()))
+                    .expect("recover split SGR report with optional delimiter");
+
+            assert_eq!(event, mouse_event(kind, 31, 16));
+            assert!(replay.is_empty());
+            assert!(queued.is_empty());
+        }
+    }
+
+    #[test]
+    fn split_sgr_preserves_standalone_escape_when_no_report_arrives() {
+        let escape = key_event(KeyCode::Esc);
+
+        let (event, replay) = recover_split_sgr_mouse(escape.clone(), |_| Ok(None))
+            .expect("preserve standalone Escape");
+
+        assert_eq!(event, escape);
+        assert!(replay.is_empty());
+    }
+
+    #[test]
+    fn split_sgr_replays_malformed_report_without_losing_or_reordering_input() {
+        let escape = key_event(KeyCode::Esc);
+        let malformed = split_sgr_events("[x");
+        let mut queued = malformed.clone();
+
+        let (event, replay) = recover_split_sgr_mouse(escape.clone(), |_| Ok(queued.pop_front()))
+            .expect("preserve malformed split report");
+
+        assert_eq!(event, escape);
+        assert_eq!(replay, malformed);
+        assert!(queued.is_empty());
+    }
+
+    #[test]
+    fn split_sgr_leaves_unsupported_mouse_report_as_original_key_input() {
+        let escape = key_event(KeyCode::Esc);
+        let unsupported = split_sgr_events("[<0;32;17M");
+        let mut queued = unsupported.clone();
+
+        let (event, replay) = recover_split_sgr_mouse(escape.clone(), |_| Ok(queued.pop_front()))
+            .expect("preserve unsupported SGR report");
+
+        assert_eq!(event, escape);
+        assert_eq!(replay, unsupported);
+        assert!(queued.is_empty());
+    }
+
+    #[test]
+    fn split_sgr_recovers_escape_queued_by_drag_read_ahead() {
+        let drag = mouse_event(
+            MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            4,
+            5,
+        );
+        let escape = key_event(KeyCode::Esc);
+        let mut queued = VecDeque::from([escape.clone()]);
+        queued.extend(split_sgr_events("[<65;32;17M"));
+
+        let (drag, pending) = coalesce_mouse_drag(drag.clone(), || Ok(queued.pop_front()))
+            .expect("preserve the first non-drag event");
+        assert_eq!(
+            drag,
+            mouse_event(
+                MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+                4,
+                5
+            )
+        );
+        assert_eq!(pending, Some(escape));
+
+        let (event, replay) = recover_split_sgr_mouse(
+            pending.expect("Escape is queued for the next loop iteration"),
+            |_| Ok(queued.pop_front()),
+        )
+        .expect("recover split SGR after drag read-ahead");
+
+        assert_eq!(event, mouse_event(MouseEventKind::ScrollDown, 31, 16));
+        assert!(replay.is_empty());
+        assert!(queued.is_empty());
     }
 
     #[test]
