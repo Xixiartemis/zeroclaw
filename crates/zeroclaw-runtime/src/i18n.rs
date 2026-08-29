@@ -527,25 +527,45 @@ mod tests {
     }
 
     #[test]
-    fn quickstart_terminal_size_unknown_is_defined_in_every_locale() {
+    fn quickstart_terminal_geometry_errors_are_defined_in_every_locale() {
         // The checklist fails closed when `Term::size_checked()` returns None.
         // That path is only reachable through this key, so a locale missing it
         // would render the raw `{key}` placeholder to the user at exactly the
         // moment we are refusing to draw an unverifiable menu.
+        let cases = [
+            ("cli-quickstart-terminal-size-unknown", vec![]),
+            (
+                "cli-quickstart-terminal-too-narrow",
+                vec![("min_width", "20"), ("width", "19")],
+            ),
+            (
+                "cli-quickstart-terminal-too-short",
+                vec![("min_height", "9"), ("height", "8")],
+            ),
+            (
+                "cli-quickstart-terminal-resized",
+                vec![
+                    ("initial_width", "80"),
+                    ("initial_height", "20"),
+                    ("current_width", "40"),
+                    ("current_height", "20"),
+                ],
+            ),
+            ("cli-quickstart-empty-checklist", vec![]),
+        ];
         for (source, locale) in channel_approval_locale_sources() {
-            let message =
-                format_ftl_message(source, locale, "cli-quickstart-terminal-size-unknown", &[])
-                    .unwrap_or_else(|| {
-                        panic!("{locale}: cli-quickstart-terminal-size-unknown should be defined")
-                    });
-            assert!(
-                !message.trim().is_empty(),
-                "{locale}: cli-quickstart-terminal-size-unknown should not be empty"
-            );
-            assert!(
-                !message.contains('{'),
-                "{locale}: the message takes no arguments; got {message:?}"
-            );
+            for (key, args) in &cases {
+                let message = format_ftl_message(source, locale, key, args)
+                    .unwrap_or_else(|| panic!("{locale}: {key} should be defined"));
+                assert!(
+                    !message.trim().is_empty(),
+                    "{locale}: {key} should not be empty"
+                );
+                assert!(
+                    !message.contains('{'),
+                    "{locale}: {key} should interpolate every argument; got {message:?}"
+                );
+            }
         }
 
         assert_eq!(

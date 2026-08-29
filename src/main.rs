@@ -303,20 +303,6 @@ fn quickstart_selector_frame_lines(
 }
 
 #[cfg(feature = "agent-runtime")]
-fn quickstart_selector_physical_rows(lines: &[String], terminal_width: usize) -> usize {
-    let terminal_width = terminal_width.max(1);
-    lines.iter().fold(0usize, |total, line| {
-        let display_width = console::measure_text_width(line);
-        let rows = display_width
-            .saturating_sub(1)
-            .checked_div(terminal_width)
-            .unwrap_or_default()
-            .saturating_add(1);
-        total.saturating_add(rows)
-    })
-}
-
-#[cfg(feature = "agent-runtime")]
 fn render_quickstart_selector(term: &console::Term, lines: &[String]) -> std::io::Result<()> {
     for line in lines {
         term.write_line(line)?;
@@ -325,20 +311,27 @@ fn render_quickstart_selector(term: &console::Term, lines: &[String]) -> std::io
 }
 
 #[cfg(feature = "agent-runtime")]
-fn clear_quickstart_selector(
-    term: &console::Term,
-    lines: &[String],
-    terminal_width: usize,
-) -> std::io::Result<()> {
-    term.clear_last_lines(quickstart_selector_physical_rows(lines, terminal_width))
+fn enter_quickstart_selector_screen(term: &console::Term) -> std::io::Result<()> {
+    term.write_str("\u{1b}[?1049h")?;
+    term.clear_screen()?;
+    term.hide_cursor()?;
+    term.flush()
+}
+
+#[cfg(feature = "agent-runtime")]
+fn leave_quickstart_selector_screen(term: &console::Term) -> std::io::Result<()> {
+    term.show_cursor()?;
+    term.write_str("\u{1b}[?1049l")?;
+    term.flush()
 }
 
 /// Render the fixed-size Quickstart checklist without dialoguer paging.
 ///
 /// The terminal dimensions sampled for fitting are part of this interaction's
 /// contract. Every input event rechecks them before navigation or selection;
-/// a resize clears the stale rendering and exits instead of allowing a redraw
-/// with strings fitted for a different width or a newly paged height.
+/// a resize exits the selector-owned alternate screen instead of trying to
+/// erase a main-screen frame whose physical rows the terminal may have
+/// reflowed. Leaving the alternate screen atomically restores unrelated output.
 #[cfg(feature = "agent-runtime")]
 fn interact_quickstart_selector(
     term: &console::Term,
@@ -352,7 +345,7 @@ fn interact_quickstart_selector(
     let current_size = quickstart_selector_terminal_size(term);
     quickstart_selector_recheck_size(initial_size, current_size)?;
 
-    term.hide_cursor()?;
+    enter_quickstart_selector_screen(term)?;
     let interaction = (|| -> Result<Option<usize>> {
         let mut selected = 0;
         let mut frame = quickstart_selector_frame_lines(labels, prompt, selected);
@@ -361,44 +354,33 @@ fn interact_quickstart_selector(
         loop {
             let key = term.read_key()?;
             let current_size = quickstart_selector_terminal_size(term);
-            if let Err(error) = quickstart_selector_recheck_size(initial_size, current_size) {
-                // Scoped cleanup: erase only the rows this selector drew.
-                // `clear_screen()` would also wipe unrelated scrollback the
-                // user did not ask us to destroy.
-                let cleanup_width = current_size
-                    .map(|(_, width)| width)
-                    .unwrap_or(initial_size.1);
-                clear_quickstart_selector(term, &frame, usize::from(cleanup_width))?;
-                return Err(error);
-            }
+            quickstart_selector_recheck_size(initial_size, current_size)?;
 
             match key {
                 console::Key::ArrowDown | console::Key::Tab | console::Key::Char('j') => {
-                    clear_quickstart_selector(term, &frame, usize::from(initial_size.1))?;
                     selected = (selected + 1) % labels.len();
                     frame = quickstart_selector_frame_lines(labels, prompt, selected);
+                    term.clear_screen()?;
                     render_quickstart_selector(term, &frame)?;
                 }
                 console::Key::ArrowUp | console::Key::BackTab | console::Key::Char('k') => {
-                    clear_quickstart_selector(term, &frame, usize::from(initial_size.1))?;
                     selected = selected.checked_sub(1).unwrap_or(labels.len() - 1);
                     frame = quickstart_selector_frame_lines(labels, prompt, selected);
+                    term.clear_screen()?;
                     render_quickstart_selector(term, &frame)?;
                 }
                 console::Key::Enter | console::Key::Char(' ') => {
-                    clear_quickstart_selector(term, &frame, usize::from(initial_size.1))?;
                     return Ok(Some(selected));
                 }
                 console::Key::Escape | console::Key::Char('q') => {
-                    clear_quickstart_selector(term, &frame, usize::from(initial_size.1))?;
                     return Ok(None);
                 }
                 _ => {}
             }
         }
     })();
-    let cursor = term.show_cursor().and_then(|()| term.flush());
-    match (interaction, cursor) {
+    let screen = leave_quickstart_selector_screen(term);
+    match (interaction, screen) {
         (Err(error), _) => Err(error),
         (Ok(_), Err(error)) => Err(error.into()),
         (Ok(selection), Ok(())) => Ok(selection),
@@ -9490,27 +9472,9 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "agent-runtime")]
-    #[test]
-    fn quickstart_selector_counts_rendered_rows_at_the_cleanup_width() {
-        let lines = vec![
-            "? short".to_string(),
-            format!("> {}", "a".repeat(77)),
-            format!("  {}", "界".repeat(20)),
-        ];
-
-        assert_eq!(quickstart_selector_physical_rows(&lines, 80), 3);
-        assert_eq!(quickstart_selector_physical_rows(&lines, 40), 5);
-        assert_eq!(
-            quickstart_selector_physical_rows(&[String::new()], 40),
-            1,
-            "an empty logical line still occupies one terminal row"
-        );
-    }
-
     #[cfg(all(feature = "agent-runtime", unix))]
     #[test]
-    fn quickstart_selector_pty_resize_clears_every_reflowed_row() {
+    fn quickstart_selector_pty_resize_restores_the_main_screen() {
         use std::fs::File;
         use std::io::Read as _;
         use std::os::fd::FromRawFd;
@@ -9601,11 +9565,14 @@ mod tests {
             std::io::Error::last_os_error()
         );
 
-        let labels = vec!["a".repeat(77), "界".repeat(38)];
-        let prompt = "Choose one of the following actions and press Enter to continue safely.";
-        let frame = quickstart_selector_frame_lines(&labels, prompt, 0);
+        let frame = quickstart_selector_frame_lines(
+            &["a".repeat(77), "界".repeat(38)],
+            "Choose one of the following actions and press Enter to continue safely.",
+            0,
+        );
+        enter_quickstart_selector_screen(&term).expect("enter selector screen");
         render_quickstart_selector(&term, &frame).expect("render selector to PTY");
-        let rendered = read_available(&mut master);
+        let mut rendered = read_available(&mut master);
         assert!(
             !rendered.is_empty(),
             "the selector should render to the PTY"
@@ -9613,23 +9580,20 @@ mod tests {
 
         set_size(master_fd, 20, 40);
         assert_eq!(term.size_checked(), Some((20, 40)));
-        let reflowed_rows = quickstart_selector_physical_rows(&frame, 40);
+        leave_quickstart_selector_screen(&term).expect("leave selector screen");
+        rendered.extend(read_available(&mut master));
+        let transcript = String::from_utf8(rendered).expect("ANSI transcript is UTF-8");
         assert!(
-            reflowed_rows > frame.len(),
-            "the resize fixture must wrap rows"
+            transcript.contains("\u{1b}[?1049h"),
+            "selector must own an alternate screen; got {transcript:?}"
         );
-
-        clear_quickstart_selector(&term, &frame, 40).expect("clear resized selector");
-        let cleanup =
-            String::from_utf8(read_available(&mut master)).expect("ANSI cleanup is UTF-8");
         assert!(
-            cleanup.starts_with(&format!("\u{1b}[{reflowed_rows}A")),
-            "cleanup must move over every physical row; got {cleanup:?}"
+            transcript.contains("\u{1b}[?1049l"),
+            "selector must restore the main screen after resize; got {transcript:?}"
         );
-        assert_eq!(
-            cleanup.matches("\u{1b}[2K").count(),
-            reflowed_rows,
-            "cleanup must erase every row reflowed by the 80x20 to 40x20 resize"
+        assert!(
+            transcript.find("\u{1b}[?1049h") < transcript.find("\u{1b}[?1049l"),
+            "the alternate screen must be entered before it is restored"
         );
     }
 
