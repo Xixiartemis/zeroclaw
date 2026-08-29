@@ -212,7 +212,7 @@ pub async fn run_local_listener(
 
                 let ctx = ctx.clone();
                 let count = client_count.clone();
-                let conn_cancel = cancel.clone();
+                let conn_cancel = cancel.child_token();
 
                 count.fetch_add(1, Ordering::Relaxed);
 
@@ -220,11 +220,13 @@ pub async fn run_local_listener(
                     let mut transport = LocalTransport::new(stream, conn_cancel.clone());
                     let peer = transport.peer_label();
                     let writer_tx = transport.writer();
-                    let mut dispatcher = RpcDispatcher::new(ctx.clone(), writer_tx, peer);
-                    tokio::select! {
-                        _ = dispatcher.run(&mut transport) => {}
-                        _ = conn_cancel.cancelled() => {}
-                    }
+                    let mut dispatcher = RpcDispatcher::new_with_connection_cancel(
+                        ctx.clone(),
+                        writer_tx,
+                        peer,
+                        conn_cancel.clone(),
+                    );
+                    dispatcher.run_connection(&mut transport).await;
 
                     if let Some(tui_id) = dispatcher.tui_id() {
                         ctx.tui_registry.unregister(tui_id);
@@ -1365,6 +1367,123 @@ mod tests {
         wait_for_client_count(&count, 0).await;
 
         drop(writer);
+    }
+
+    #[cfg(unix)]
+    async fn assert_reload_drains_local_connection_generation() {
+        use crate::rpc::dispatch::connection_test_support::{QUEUED_SID, RUNNING_SID, fixture};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture = fixture(tmp.path()).await;
+        let sock_path = fixture.ctx.config.read().data_dir.join("daemon.sock");
+        let cancel = CancellationToken::new();
+        let count = Arc::new(AtomicUsize::new(0));
+        let queued_guard = fixture
+            .ctx
+            .sessions
+            .session_queue
+            .acquire(QUEUED_SID)
+            .await
+            .expect("test should hold the queued session actor");
+
+        let server_cancel = cancel.clone();
+        let server_ctx = Arc::clone(&fixture.ctx);
+        let server_count = Arc::clone(&count);
+        zeroclaw_spawn::spawn!(async move {
+            let _ = run_local_listener(server_ctx, server_cancel, server_count, None).await;
+        });
+
+        wait_for_socket(&sock_path).await;
+        let (_reader, mut writer) = do_initialize(&sock_path).await;
+        wait_for_client_count(&count, 1).await;
+        writer
+            .write_all(
+                rpc_request(
+                    Method::SessionPrompt,
+                    &serde_json::json!({"session_id": RUNNING_SID, "prompt": "run"}),
+                    2,
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), fixture.provider_started.notified())
+            .await
+            .expect("running prompt should reach the provider");
+
+        writer
+            .write_all(
+                rpc_request(
+                    Method::SessionPrompt,
+                    &serde_json::json!({"session_id": QUEUED_SID, "prompt": "queue"}),
+                    3,
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while fixture
+                .ctx
+                .sessions
+                .session_queue
+                .queue_depth(QUEUED_SID)
+                .await
+                < 2
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("second prompt should be waiting in the session actor queue");
+
+        cancel.cancel();
+        wait_for_client_count(&count, 0).await;
+
+        assert!(
+            fixture
+                .provider_dropped
+                .load(std::sync::atomic::Ordering::Acquire),
+            "reload must cancel and join the running provider future"
+        );
+        assert_eq!(
+            fixture
+                .queued_provider_calls
+                .load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "a queued prompt from the closed generation must never execute"
+        );
+        assert_eq!(
+            fixture
+                .ctx
+                .sessions
+                .session_queue
+                .queue_depth(QUEUED_SID)
+                .await,
+            1,
+            "only the deliberate test holder should remain queued"
+        );
+        assert!(!fixture.ctx.sessions.has_inflight_turn(RUNNING_SID));
+        drop(queued_guard);
+        drop(writer);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reload_drains_running_and_queued_prompts_for_local_connection_generation() {
+        std::thread::Builder::new()
+            .name("local-connection-generation".to_string())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(assert_reload_drains_local_connection_generation());
+            })
+            .unwrap()
+            .join()
+            .expect("local connection generation test thread should not panic");
     }
 
     #[tokio::test]

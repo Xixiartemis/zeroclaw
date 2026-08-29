@@ -13,14 +13,13 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
-
-type TlsStream = tokio_rustls::server::TlsStream<TcpStream>;
 
 /// How long the read side waits for any frame before sending a liveness Ping.
 const HEARTBEAT_IDLE: Duration = Duration::from_secs(20);
@@ -102,8 +101,11 @@ async fn run_writer<S>(
     let _ = tokio::time::timeout(close_timeout, sink.close()).await;
 }
 
-pub struct WssTransport {
-    reader: futures_util::stream::SplitStream<WebSocketStream<TlsStream>>,
+pub struct WssTransport<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    reader: futures_util::stream::SplitStream<WebSocketStream<S>>,
     writer_tx: mpsc::Sender<String>,
     control_tx: mpsc::Sender<Control>,
     peer_label: String,
@@ -112,12 +114,11 @@ pub struct WssTransport {
     awaiting_pong: bool,
 }
 
-impl WssTransport {
-    pub fn new(
-        ws: WebSocketStream<TlsStream>,
-        remote_addr: SocketAddr,
-        cancel: CancellationToken,
-    ) -> Self {
+impl<S> WssTransport<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    pub fn new(ws: WebSocketStream<S>, remote_addr: SocketAddr, cancel: CancellationToken) -> Self {
         let peer_label = format!("wss:{remote_addr}");
         let (sink, stream) = ws.split();
 
@@ -142,7 +143,10 @@ impl WssTransport {
 }
 
 #[async_trait]
-impl RpcTransport for WssTransport {
+impl<S> RpcTransport for WssTransport<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     fn writer(&self) -> mpsc::Sender<String> {
         self.writer_tx.clone()
     }
@@ -271,7 +275,7 @@ pub async fn run_wss_listener(
                 let ctx = ctx.clone();
                 let count = client_count.clone();
                 let acceptor = tls_acceptor.clone();
-                let conn_cancel = cancel.clone();
+                let conn_cancel = cancel.child_token();
 
                 count.fetch_add(1, Ordering::Relaxed);
 
@@ -310,11 +314,13 @@ pub async fn run_wss_listener(
                         WssTransport::new(ws_stream, remote_addr, conn_cancel.clone());
                     let peer = transport.peer_label();
                     let writer_tx = transport.writer();
-                    let mut dispatcher = RpcDispatcher::new(ctx.clone(), writer_tx, peer);
-                    tokio::select! {
-                        _ = dispatcher.run(&mut transport) => {}
-                        _ = conn_cancel.cancelled() => {}
-                    }
+                    let mut dispatcher = RpcDispatcher::new_with_connection_cancel(
+                        ctx.clone(),
+                        writer_tx,
+                        peer,
+                        conn_cancel.clone(),
+                    );
+                    dispatcher.run_connection(&mut transport).await;
 
                     if let Some(tui_id) = dispatcher.tui_id() {
                         ctx.tui_registry.unregister(tui_id);
@@ -348,8 +354,10 @@ pub async fn run_wss_listener(
 
 #[cfg(test)]
 mod accept_error_tests {
-    use super::{Control, is_recoverable_accept_error, run_writer};
-    use futures_util::StreamExt;
+    use super::{Control, WssTransport, is_recoverable_accept_error, run_writer};
+    use crate::rpc::dispatch::{Method, RpcDispatcher};
+    use crate::rpc::types::InitializeParams;
+    use futures_util::{SinkExt, StreamExt};
     use std::io::{Error, ErrorKind};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -358,8 +366,10 @@ mod accept_error_tests {
     use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
     use tokio::sync::mpsc;
     use tokio_tungstenite::WebSocketStream;
+    use tokio_tungstenite::tungstenite::Message;
     use tokio_tungstenite::tungstenite::protocol::Role;
     use tokio_util::sync::CancellationToken;
+    use zeroclaw_api::jsonrpc::{JSONRPC_VERSION, JsonRpcRequest};
 
     struct NonReadingPeer {
         write_polled: Arc<AtomicBool>,
@@ -439,6 +449,165 @@ mod accept_error_tests {
             .await
             .expect("cancellation and bounded Close must release the writer task")
             .expect("writer task should not panic");
+    }
+
+    fn rpc_request<T: serde::Serialize>(method: Method, params: &T, id: u64) -> String {
+        serde_json::to_string(&JsonRpcRequest::new(
+            method.wire_name(),
+            serde_json::to_value(params).unwrap(),
+            serde_json::Value::Number(id.into()),
+        ))
+        .unwrap()
+    }
+
+    async fn assert_reload_drains_wss_connection_generation() {
+        use crate::rpc::dispatch::connection_test_support::{QUEUED_SID, RUNNING_SID, fixture};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture = fixture(tmp.path()).await;
+        let queued_guard = fixture
+            .ctx
+            .sessions
+            .session_queue
+            .acquire(QUEUED_SID)
+            .await
+            .expect("test should hold the queued session actor");
+        let listener_cancel = CancellationToken::new();
+        let connection_cancel = listener_cancel.child_token();
+        let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+        let (server_ws, client_ws) = tokio::join!(
+            WebSocketStream::from_raw_socket(server_io, Role::Server, None),
+            WebSocketStream::from_raw_socket(client_io, Role::Client, None),
+        );
+        let mut transport = WssTransport::new(
+            server_ws,
+            "127.0.0.1:43110".parse().unwrap(),
+            connection_cancel.clone(),
+        );
+        let writer_tx = crate::rpc::transport::RpcTransport::writer(&transport);
+        let mut dispatcher = RpcDispatcher::new_with_connection_cancel(
+            Arc::clone(&fixture.ctx),
+            writer_tx,
+            "wss:127.0.0.1:43110".to_string(),
+            connection_cancel,
+        );
+        let connection = zeroclaw_spawn::spawn!(async move {
+            dispatcher.run_connection(&mut transport).await;
+        });
+        let (mut client_sink, mut client_stream) = client_ws.split();
+
+        let init = InitializeParams {
+            protocol_version: 1,
+            tui_id: None,
+            tui_sig: None,
+            env: Default::default(),
+            client_capabilities: None,
+        };
+        client_sink
+            .send(Message::Text(
+                rpc_request(Method::Initialize, &init, 1).into(),
+            ))
+            .await
+            .unwrap();
+        let initialized = client_stream
+            .next()
+            .await
+            .expect("initialize response frame")
+            .expect("initialize response should be valid");
+        let initialized: serde_json::Value = serde_json::from_str(
+            initialized
+                .to_text()
+                .expect("initialize response should be text"),
+        )
+        .unwrap();
+        assert_eq!(initialized["jsonrpc"], JSONRPC_VERSION);
+        assert!(initialized["error"].is_null());
+
+        client_sink
+            .send(Message::Text(
+                rpc_request(
+                    Method::SessionPrompt,
+                    &serde_json::json!({"session_id": RUNNING_SID, "prompt": "run"}),
+                    2,
+                )
+                .into(),
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), fixture.provider_started.notified())
+            .await
+            .expect("running prompt should reach the provider");
+
+        client_sink
+            .send(Message::Text(
+                rpc_request(
+                    Method::SessionPrompt,
+                    &serde_json::json!({"session_id": QUEUED_SID, "prompt": "queue"}),
+                    3,
+                )
+                .into(),
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while fixture
+                .ctx
+                .sessions
+                .session_queue
+                .queue_depth(QUEUED_SID)
+                .await
+                < 2
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("second prompt should be waiting in the session actor queue");
+
+        listener_cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(7), connection)
+            .await
+            .expect("WSS connection must drain generation-owned prompt tasks")
+            .expect("WSS connection task should not panic");
+
+        assert!(
+            fixture.provider_dropped.load(Ordering::Acquire),
+            "reload must cancel and join the running provider future"
+        );
+        assert_eq!(
+            fixture.queued_provider_calls.load(Ordering::Acquire),
+            0,
+            "a queued prompt from the closed generation must never execute"
+        );
+        assert_eq!(
+            fixture
+                .ctx
+                .sessions
+                .session_queue
+                .queue_depth(QUEUED_SID)
+                .await,
+            1,
+            "only the deliberate test holder should remain queued"
+        );
+        assert!(!fixture.ctx.sessions.has_inflight_turn(RUNNING_SID));
+        drop(queued_guard);
+    }
+
+    #[test]
+    fn reload_drains_running_and_queued_prompts_for_wss_connection_generation() {
+        std::thread::Builder::new()
+            .name("wss-connection-generation".to_string())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(assert_reload_drains_wss_connection_generation());
+            })
+            .unwrap()
+            .join()
+            .expect("WSS connection generation test thread should not panic");
     }
 
     #[cfg(unix)]
