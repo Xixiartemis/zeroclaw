@@ -30537,7 +30537,9 @@ This is an example JSON object for profile settings."#;
             channels_by_name,
             provider_impl.clone(),
             Arc::new(zeroclaw_config::schema::Config::default()),
-            Arc::new(vec![]),
+            Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]),
+            ),
         );
         let ctx = Arc::new(ChannelRuntimeContext {
             workspace_dir: Arc::new(workspace.path().to_path_buf()),
@@ -30700,7 +30702,9 @@ This is an example JSON object for profile settings."#;
                 channels_by_name,
                 provider_impl.clone(),
                 Arc::new(zeroclaw_config::schema::Config::default()),
-                Arc::new(vec![]),
+                Arc::new(
+                    zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]),
+                ),
             );
             let ctx = Arc::new(ChannelRuntimeContext {
                 workspace_dir: Arc::new(workspace.path().to_path_buf()),
