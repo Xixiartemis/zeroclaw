@@ -105,6 +105,27 @@ pub async fn run_live_case(
     let approvals = Arc::new(ApprovalManager::for_non_interactive_backchannel(&risk));
 
     let tools = live_tool_registry(&effective, policy.clone());
+    let eval_config = zeroclaw_config::schema::Config::default();
+    let tools = zeroclaw_runtime::tools::scoped::ScopedToolRegistry::assemble(
+        zeroclaw_runtime::tools::scoped::ScopedAssembly {
+            config: &eval_config,
+            agent_alias: "eval",
+            security: &policy,
+            built: zeroclaw_runtime::tools::AllToolsResult::from_prebuilt_tools(tools),
+            skills: &[],
+            runtime: Arc::new(zeroclaw_runtime::platform::NativeRuntime::new()),
+            caller_allowed: None,
+            connect_mcp: false,
+            connect_peripherals: false,
+            exclude_memory: false,
+            acp_delivery: false,
+            list_deferred_mcp_specs: false,
+            emit_assembly_logs: false,
+            mcp_registry: None,
+        },
+    )
+    .await
+    .registry;
     // Empty allowlist -> None so the echo registry's own tool is usable; a
     // `Some(vec![])` would deny every tool including echo. Non-empty -> the
     // allowlist backs the already-filtered registry as defense in depth.
@@ -123,12 +144,18 @@ pub async fn run_live_case(
     let observer = Arc::new(RecordingObserver::new());
     let provider = (deps.provider)(trace)?.provider;
     // Resolve the dispatcher from the provider's capabilities so XML-dialect
-    // providers work; a default agent config routes purely by capability.
-    let dispatcher =
-        tool_dispatcher_for_provider(&AliasedAgentConfig::default(), provider.as_ref());
+    // providers work; a default agent config routes purely by capability. Keep
+    // the dispatcher probe and agent request on the same explicit model value.
+    let model_name = "<unconfigured>";
+    let dispatcher = tool_dispatcher_for_provider(
+        &AliasedAgentConfig::default(),
+        provider.as_ref(),
+        model_name,
+    );
 
     let mut agent = Agent::builder()
         .model_provider(provider)
+        .model_name(model_name.to_string())
         .tools(tools)
         .memory(memory)
         .observer(observer.clone())

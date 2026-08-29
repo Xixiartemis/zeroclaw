@@ -4,7 +4,7 @@
 
 use async_trait::async_trait;
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
 use zeroclaw_api::model_provider::{
     ChatRequest, ChatResponse, ModelProvider, ProviderCapabilities, TokenUsage, ToolCall,
@@ -18,6 +18,13 @@ use crate::case::{LlmTrace, TraceResponse};
 struct ReplayState {
     turns: Vec<VecDeque<TraceResponse>>,
     current: usize,
+}
+
+fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
 }
 
 /// Replays a trace's scripted steps, one queue per turn.
@@ -79,7 +86,7 @@ impl ReplayHandle {
     /// the cursor to the next turn. Errors if any steps were left unconsumed — including
     /// on the final turn, where flattened replay would otherwise ignore them silently.
     pub fn finish_turn(&self, turn_index: usize) -> anyhow::Result<()> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = lock_recover(&self.state);
         let leftover = state.turns.get(state.current).map_or(0, VecDeque::len);
         if leftover > 0 {
             anyhow::bail!(
@@ -150,7 +157,7 @@ impl ModelProvider for TraceLlmProvider {
         _temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
         let step = {
-            let mut state = self.state.lock().unwrap();
+            let mut state = lock_recover(&self.state);
             let current = state.current;
             match state.turns.get_mut(current).and_then(VecDeque::pop_front) {
                 Some(step) => step,
