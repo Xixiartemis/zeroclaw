@@ -20325,7 +20325,7 @@ impl Config {
         // of silently no-op'ing.
         if self.security.audit.enabled {
             warnings.push(crate::validation_warnings::ValidationWarning::new(
-                "security_audit_enabled_has_no_effect",
+                crate::validation_warnings::SECURITY_AUDIT_ENABLED_HAS_NO_EFFECT,
                 "security.audit.enabled=true has no effect: command audit logging is not wired \
                  into the runtime yet, so no commands are written to the configured audit \
                  path. Use an external supervisor or logging wrapper that observes the \

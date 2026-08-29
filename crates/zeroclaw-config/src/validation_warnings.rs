@@ -20,6 +20,9 @@ use serde::{Deserialize, Serialize};
 /// and the wording is not.
 pub const VERIFIABLE_INTENT_TOOL_WITHHELD: &str = "verifiable_intent_tool_withheld";
 
+/// Stable code for an explicitly enabled but unwired command-audit writer.
+pub const SECURITY_AUDIT_ENABLED_HAS_NO_EFFECT: &str = "security_audit_enabled_has_no_effect";
+
 /// One non-fatal validation issue surfaced after a successful save.
 ///
 /// Stable codes (extend as new warnings are added):
