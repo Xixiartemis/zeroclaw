@@ -313,7 +313,9 @@ impl InteractiveInterrupt {
         #[cfg(any(unix, windows))]
         {
             self.signal.recv().await.ok_or_else(|| {
-                std::io::Error::other("interactive Ctrl+C signal stream closed unexpectedly")
+                std::io::Error::other(crate::i18n::get_required_cli_string(
+                    "cli-agent-interactive-signal-stream-closed",
+                ))
             })
         }
 
@@ -420,7 +422,11 @@ impl InteractiveInputTask {
 
     fn request_line(&self) -> std::io::Result<()> {
         self.request_tx.try_send(()).map_err(|error| {
-            std::io::Error::other(format!("interactive input task unavailable: {error}"))
+            let error = error.to_string();
+            std::io::Error::other(crate::i18n::get_required_cli_string_with_args(
+                "cli-agent-interactive-input-task-unavailable",
+                &[("error", error.as_str())],
+            ))
         })
     }
 }
@@ -441,15 +447,15 @@ async fn wait_for_interactive_idle_event(
         notice = signal_notices.recv() => match notice {
             Some(InteractiveSignalNotice::Exit) => Ok(InteractiveIdleEvent::Interrupt),
             Some(InteractiveSignalNotice::Failed(error)) => Err(error),
-            None => Err(std::io::Error::other(
-                "interactive Ctrl+C signal task stopped unexpectedly",
-            )),
+            None => Err(std::io::Error::other(crate::i18n::get_required_cli_string(
+                "cli-agent-interactive-signal-task-stopped",
+            ))),
         },
         input_result = input.result_rx.recv() => match input_result {
             Some(result) => Ok(InteractiveIdleEvent::Input(result)),
-            None => Err(std::io::Error::other(
-                "interactive input task stopped unexpectedly",
-            )),
+            None => Err(std::io::Error::other(crate::i18n::get_required_cli_string(
+                "cli-agent-interactive-input-task-stopped",
+            ))),
         },
     }
 }
@@ -2402,11 +2408,15 @@ pub async fn run(
             }
         } else {
             let interactive_phase = Arc::new(parking_lot::Mutex::new(InteractivePhase::Idle));
-            let (mut signal_notices, signal_task) =
-                spawn_interactive_signal_task(Arc::clone(&interactive_phase))
-                    .context("failed to initialize interactive Ctrl+C handling")?;
-            let mut input_task = InteractiveInputTask::spawn()
-                .context("failed to initialize interactive input handling")?;
+            let (mut signal_notices, signal_task) = spawn_interactive_signal_task(Arc::clone(
+                &interactive_phase,
+            ))
+            .context(crate::i18n::get_required_cli_string(
+                "cli-agent-interactive-signal-init-failed",
+            ))?;
+            let mut input_task = InteractiveInputTask::spawn().context(
+                crate::i18n::get_required_cli_string("cli-agent-interactive-input-init-failed"),
+            )?;
 
             println!("🦀 ZeroClaw Interactive Mode");
             println!("Type /help for commands.\n");
@@ -2428,8 +2438,9 @@ pub async fn run(
                 let input =
                     match wait_for_interactive_idle_event(&mut input_task, &mut signal_notices)
                         .await
-                        .context("interactive input lifecycle failed")?
-                    {
+                        .context(crate::i18n::get_required_cli_string(
+                            "cli-agent-interactive-input-lifecycle-failed",
+                        ))? {
                         InteractiveIdleEvent::Interrupt => {
                             println!();
                             break 'interactive;
@@ -2480,8 +2491,9 @@ pub async fn run(
                             &mut signal_notices,
                         )
                         .await
-                        .context("interactive confirmation input lifecycle failed")?
-                        {
+                        .context(crate::i18n::get_required_cli_string(
+                            "cli-agent-interactive-confirmation-input-lifecycle-failed",
+                        ))? {
                             InteractiveIdleEvent::Interrupt => {
                                 println!();
                                 break 'interactive;
@@ -16872,6 +16884,27 @@ Let me check the result."#;
         assert_eq!(phase.on_interrupt(), InteractiveInterruptAction::Exit);
         assert!(matches!(phase, InteractivePhase::Stopping));
         assert!(phase.begin_turn().is_none());
+    }
+
+    #[test]
+    fn interactive_lifecycle_error_keys_resolve_through_fluent() {
+        for key in [
+            "cli-agent-interactive-signal-stream-closed",
+            "cli-agent-interactive-input-task-unavailable",
+            "cli-agent-interactive-signal-task-stopped",
+            "cli-agent-interactive-input-task-stopped",
+            "cli-agent-interactive-signal-init-failed",
+            "cli-agent-interactive-input-init-failed",
+            "cli-agent-interactive-input-lifecycle-failed",
+            "cli-agent-interactive-confirmation-input-lifecycle-failed",
+        ] {
+            let resolved = if key == "cli-agent-interactive-input-task-unavailable" {
+                crate::i18n::get_required_cli_string_with_args(key, &[("error", "closed")])
+            } else {
+                crate::i18n::get_required_cli_string(key)
+            };
+            assert_ne!(resolved, format!("{{{key}}}"), "missing Fluent key {key}");
+        }
     }
 
     #[test]
