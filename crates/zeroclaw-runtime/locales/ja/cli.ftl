@@ -1006,3 +1006,7 @@ channel-approval-opt-allow-once = 今回のみ許可
 channel-approval-opt-allow-always = 常に許可
 channel-approval-opt-reject = 拒否
 channel-approval-opt-reject-with-edit = 編集して拒否
+
+# ── Agent vision capability errors ──
+cli-agent-vision-unsupported-by-fallback = {$marker_count} 個の画像マーカーを受信しましたが、フォールバック model_provider={$fallback_name} は画像入力をサポートしていません
+cli-agent-vision-unsupported-by-provider = {$marker_count} 個の画像マーカーを受信しましたが、この model_provider は画像入力をサポートしていません

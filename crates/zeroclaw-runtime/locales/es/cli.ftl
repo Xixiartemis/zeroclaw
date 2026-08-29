@@ -1006,3 +1006,7 @@ channel-approval-opt-allow-once = Permitir una vez
 channel-approval-opt-allow-always = Permitir siempre
 channel-approval-opt-reject = Rechazar
 channel-approval-opt-reject-with-edit = Rechazar con edición
+
+# ── Agent vision capability errors ──
+cli-agent-vision-unsupported-by-fallback = Se recibieron {$marker_count} marcadores de imagen, pero el model_provider alternativo={$fallback_name} no admite entrada de visión
+cli-agent-vision-unsupported-by-provider = Se recibieron {$marker_count} marcadores de imagen, pero este model_provider no admite entrada de visión

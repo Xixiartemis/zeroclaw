@@ -1096,6 +1096,8 @@ cli-delegate-error-invalid-semantic-completion = Agent '{$agent_name}' failed: m
 cli-agent-error-invalid-semantic-completion = The model provider returned an invalid semantic completion.
 cli-delegate-error-incomplete-after-provider-tools = Agent '{$agent_name}' failed: the model provider ended after provider-executed tools without a final response.
 cli-agent-error-incomplete-after-provider-tools = The model provider ended after provider-executed tools without a final response.
+cli-agent-vision-unsupported-by-fallback = received {$marker_count} image marker(s), but fallback model_provider={$fallback_name} does not support vision input
+cli-agent-vision-unsupported-by-provider = received {$marker_count} image marker(s), but this model_provider does not support vision input
 cli-doctor-context-window-ok = {$provider_ref}: context window: {$context_window} tokens
 cli-doctor-context-window-zero = {$provider_ref}: context_window is 0 (invalid; set it to the model's real context limit)
 cli-doctor-context-window-unset = {$provider_ref}: no context_window set — will use {$fallback} token fallback when selected; likely far below this model's real limit; set context_window on this profile

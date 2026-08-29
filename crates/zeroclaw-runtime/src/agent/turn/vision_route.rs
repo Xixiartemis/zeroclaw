@@ -91,12 +91,18 @@ pub(crate) fn resolve_vision_provider(
             // safe to surface without re-deriving primary-vs-fallback from
             // `provider_name`, whose format is not guaranteed to line up
             // with the dotted entry name.
+            let marker_count = latest_user_image_marker_count.to_string();
             let message = match model_provider.vision_limited_by(model) {
-                Some(fallback_name) => format!(
-                    "received {latest_user_image_marker_count} image marker(s), but fallback model_provider={fallback_name} does not support vision input"
+                Some(fallback_name) => crate::i18n::get_required_cli_string_with_args(
+                    "cli-agent-vision-unsupported-by-fallback",
+                    &[
+                        ("marker_count", marker_count.as_str()),
+                        ("fallback_name", fallback_name.as_str()),
+                    ],
                 ),
-                None => format!(
-                    "received {latest_user_image_marker_count} image marker(s), but this model_provider does not support vision input"
+                None => crate::i18n::get_required_cli_string_with_args(
+                    "cli-agent-vision-unsupported-by-provider",
+                    &[("marker_count", marker_count.as_str())],
                 ),
             };
             return Err(ProviderCapabilityError {

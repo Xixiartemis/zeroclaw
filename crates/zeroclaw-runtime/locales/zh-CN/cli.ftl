@@ -1005,3 +1005,7 @@ channel-approval-opt-allow-once = 仅本次允许
 channel-approval-opt-allow-always = 始终允许
 channel-approval-opt-reject = 拒绝
 channel-approval-opt-reject-with-edit = 编辑后拒绝
+
+# ── Agent vision capability errors ──
+cli-agent-vision-unsupported-by-fallback = 收到 {$marker_count} 个图像标记，但回退 model_provider={$fallback_name} 不支持视觉输入
+cli-agent-vision-unsupported-by-provider = 收到 {$marker_count} 个图像标记，但此 model_provider 不支持视觉输入
