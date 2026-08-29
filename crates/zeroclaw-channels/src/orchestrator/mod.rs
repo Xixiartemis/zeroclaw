@@ -11954,6 +11954,69 @@ fn compose_channel_mcp_prompt_sections(
     expose_text_tool_protocol
 }
 
+/// Restore one persisted channel session to its authoritative live owner.
+/// Explicit agent attribution takes precedence exactly as it does for scoped
+/// session access. A stale/disabled attributed agent fails closed instead of
+/// widening through a channel that may now be routed elsewhere.
+fn hydrate_persisted_session_history(
+    store: &dyn SessionBackend,
+    metadata: &zeroclaw_infra::session_backend::SessionMetadata,
+    agent_ctxs: &HashMap<String, Arc<ChannelRuntimeContext>>,
+    owner_by_channel_key: &HashMap<String, String>,
+) -> Option<bool> {
+    let owner_agent = metadata.agent_alias.clone().or_else(|| {
+        metadata
+            .channel_id
+            .as_deref()
+            .and_then(|channel_id| owner_by_channel_key.get(channel_id).cloned())
+            .or_else(|| {
+                metadata
+                    .channel_id
+                    .as_deref()
+                    .and_then(|channel_id| channel_id.split_once('.').map(|(base, _)| base))
+                    .and_then(|base| owner_by_channel_key.get(base).cloned())
+            })
+    });
+    let target_ctx = owner_agent
+        .as_ref()
+        .and_then(|alias| agent_ctxs.get(alias))?;
+    let mut messages = store.load(&metadata.key);
+    if messages.is_empty() {
+        return None;
+    }
+    if messages.len() > MAX_CHANNEL_HISTORY {
+        messages.drain(..messages.len() - MAX_CHANNEL_HISTORY);
+    }
+
+    let orphan_closed = messages
+        .last()
+        .is_some_and(|message| message.role == "user");
+    if orphan_closed {
+        let closure = ChatMessage::assistant("[Session interrupted — not continuing this request]");
+        if let Err(error) = store.append(&metadata.key, &closure) {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"error": error.to_string()})),
+                &format!("Failed to persist orphan closure for {}", metadata.key)
+            );
+        }
+        messages.push(closure);
+    }
+    let pruned =
+        zeroclaw_runtime::agent::history_pruner::remove_orphaned_tool_messages(&mut messages);
+    if !pruned.is_empty() {
+        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"category": "agent", "agent_alias": owner_agent.as_deref().unwrap_or(""), "channel": metadata.channel_id.as_deref().unwrap_or(""), "session_key": metadata.key, "removed": pruned.removed, "orphan_tool_call_ids": pruned.orphan_tool_call_ids})), "removed orphaned tool messages from restored history (tool_use/tool_result pairing inconsistency auto-healed)");
+    }
+
+    target_ctx
+        .conversation_histories
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .push(metadata.key.clone(), messages);
+    Some(orphan_closed)
+}
+
 /// Start all configured channels and route messages to the agent
 #[allow(clippy::too_many_lines)]
 pub async fn start_channels(
@@ -12638,9 +12701,9 @@ pub async fn start_channels(
         .owner_by_channel_key();
 
     // Hydrate persisted session histories into the owning agent's
-    // `conversation_histories` LRU. Sessions whose channel has no enabled
-    // owner are skipped so their history doesn't end up loaded into the
-    // fallback agent (which wouldn't reply on that channel anyway).
+    // `conversation_histories` LRU. Explicit persisted agent ownership is
+    // authoritative; channel routing is only the legacy fallback for rows
+    // without an agent attribution.
     if let Some(ref store) = shared_session_store {
         let mut metadata = store.list_sessions_with_metadata();
         metadata.sort_by_key(|m| std::cmp::Reverse(m.last_activity));
@@ -12655,54 +12718,15 @@ pub async fn start_channels(
         let mut hydrated = 0usize;
         let mut orphans_closed = 0usize;
         for m in metadata {
-            let owner_agent = m
-                .channel_id
-                .as_deref()
-                .and_then(|cid| owner_by_channel_key.get(cid).cloned())
-                .or_else(|| {
-                    m.channel_id
-                        .as_deref()
-                        .and_then(|cid| cid.split_once('.').map(|(b, _)| b.to_string()))
-                        .and_then(|b| owner_by_channel_key.get(&b).cloned())
-                });
-            let target_ctx = match owner_agent.as_ref().and_then(|a| agent_ctxs.get(a)) {
-                Some(ctx) => ctx,
-                None => continue,
-            };
-            let mut msgs = store.load(&m.key);
-            if msgs.is_empty() {
-                continue;
+            if let Some(orphan_closed) = hydrate_persisted_session_history(
+                store.as_ref(),
+                &m,
+                &agent_ctxs,
+                &owner_by_channel_key,
+            ) {
+                hydrated += 1;
+                orphans_closed += usize::from(orphan_closed);
             }
-            if msgs.len() > MAX_CHANNEL_HISTORY {
-                msgs.drain(..msgs.len() - MAX_CHANNEL_HISTORY);
-            }
-            if msgs.last().is_some_and(|msg| msg.role == "user") {
-                let closure =
-                    ChatMessage::assistant("[Session interrupted — not continuing this request]");
-                if let Err(e) = store.append(&m.key, &closure) {
-                    ::zeroclaw_log::record!(
-                        DEBUG,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                        &format!("Failed to persist orphan closure for {}", m.key)
-                    );
-                }
-                msgs.push(closure);
-                orphans_closed += 1;
-            }
-            let pruned =
-                zeroclaw_runtime::agent::history_pruner::remove_orphaned_tool_messages(&mut msgs);
-            if !pruned.is_empty() {
-                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"category": "agent", "agent_alias": owner_agent.as_deref().unwrap_or(""), "channel": m.channel_id.as_deref().unwrap_or(""), "session_key": m.key, "removed": pruned.removed, "orphan_tool_call_ids": pruned.orphan_tool_call_ids})), "removed orphaned tool messages from restored history (tool_use/tool_result pairing inconsistency auto-healed)");
-            }
-
-            let mut histories = target_ctx
-                .conversation_histories
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            histories.push(m.key.clone(), msgs);
-            drop(histories);
-            hydrated += 1;
         }
         if hydrated > 0 {
             ::zeroclaw_log::record!(
@@ -14846,6 +14870,103 @@ temperature = 0.3
             .await
             .unwrap();
         assert!(sent.success);
+    }
+
+    #[test]
+    fn restart_hydration_prefers_persisted_agent_for_aliasless_and_mixed_metadata() {
+        use zeroclaw_infra::session_backend::SessionContext;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        {
+            let store = SqliteSessionBackend::new(tmp.path()).unwrap();
+            for key in ["aliasless", "mixed-owner", "disabled-owner"] {
+                store
+                    .append(key, &ChatMessage::assistant(format!("history for {key}")))
+                    .unwrap();
+            }
+            store.set_session_agent_alias("aliasless", "alpha").unwrap();
+            store
+                .set_session_agent_alias("mixed-owner", "alpha")
+                .unwrap();
+            store
+                .set_session_context(
+                    "mixed-owner",
+                    SessionContext {
+                        channel_id: Some("discord.ops"),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            store
+                .set_session_agent_alias("disabled-owner", "disabled")
+                .unwrap();
+            store
+                .set_session_context(
+                    "disabled-owner",
+                    SessionContext {
+                        channel_id: Some("discord.ops"),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+
+        // Reopen the production backend to exercise startup hydration from
+        // persisted metadata rather than same-process state.
+        let store = SqliteSessionBackend::new(tmp.path()).unwrap();
+        let make_ctx = |alias: &str| {
+            Arc::new(ChannelRuntimeContext {
+                agent_alias: Arc::new(alias.to_string()),
+                conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                    std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+                ))),
+                ..(*router_test_ctx()).clone()
+            })
+        };
+        let alpha = make_ctx("alpha");
+        let beta = make_ctx("beta");
+        let agent_ctxs = HashMap::from([
+            ("alpha".to_string(), Arc::clone(&alpha)),
+            ("beta".to_string(), Arc::clone(&beta)),
+        ]);
+        let owner_by_channel_key = HashMap::from([("discord.ops".to_string(), "beta".to_string())]);
+
+        for metadata in store.list_sessions_with_metadata() {
+            hydrate_persisted_session_history(
+                &store,
+                &metadata,
+                &agent_ctxs,
+                &owner_by_channel_key,
+            );
+        }
+
+        let alpha_histories = alpha
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert!(
+            alpha_histories.peek("aliasless").is_some(),
+            "an alias-less channel session must hydrate from its persisted agent owner"
+        );
+        assert!(
+            alpha_histories.peek("mixed-owner").is_some(),
+            "explicit agent attribution must win over current channel routing"
+        );
+        assert!(alpha_histories.peek("disabled-owner").is_none());
+        drop(alpha_histories);
+
+        let beta_histories = beta
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert!(
+            beta_histories.peek("mixed-owner").is_none(),
+            "channel fallback must not widen an explicitly attributed row"
+        );
+        assert!(
+            beta_histories.peek("disabled-owner").is_none(),
+            "a stale or disabled explicit owner must fail closed"
+        );
     }
 
     #[tokio::test]
