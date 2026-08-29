@@ -54,9 +54,13 @@ is assigned to that alias on the next startup. Assigned rows obey the same
 directional `read_knowledge_from` rules as newly captured knowledge.
 
 Agent rename moves knowledge ownership, while delete archives and purges it.
-Initial rename works through the supported gateway or CLI lifecycle surfaces,
-but only the gateway currently has a committed-rename retry path, and that path
-uses a gateway-local residue probe rather than the shared delete resolver.
+Initial rename works through the supported gateway or CLI lifecycle surfaces.
+After a partially committed rename, the gateway can retry through its local
+residue probe and the RPC lifecycle path can resume the shared owned-state
+cascade when the destination exists and residue remains. The CLI cannot retry
+after the source alias has been durably removed.
+[Issue #10373](https://github.com/zeroclaw-labs/zeroclaw/issues/10373) tracks a
+shared committed-rename recovery contract across all three surfaces.
 
 The migrated edge schema retains the old three-column uniqueness rule for
 owner-less inserts, so temporarily rolling back to a pre-attribution binary does

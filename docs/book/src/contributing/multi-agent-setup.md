@@ -72,7 +72,7 @@ zeroclaw agents rename researcher analyst
 
 Both surfaces rewrite references to the alias, persist the config, move the default per-alias workspace, and re-point owned memory, knowledge graph, cron, ACP, and session state. Custom workspace paths do not move because they are not derived from the alias. The reserved `default` alias cannot be renamed from or to.
 
-Read any warnings in the response. The config rename commits before workspace and owned-state migration, so warnings identify a side effect that still needs attention. The same gateway API rename request can be reissued to retry residue left under the old alias.
+Read any warnings in the response. The config rename commits before workspace and owned-state migration, so warnings identify a side effect that still needs attention. The same gateway API rename request can be reissued to retry residue left under the old alias. The RPC lifecycle path can also resume the shared owned-state cascade when the destination exists and residue remains. The CLI cannot retry a committed rename after the source alias has been durably removed; use the gateway or RPC path for recovery. [Issue #10373](https://github.com/zeroclaw-labs/zeroclaw/issues/10373) tracks a shared recovery contract for all three surfaces.
 
 ## Delete an agent
 
