@@ -164,6 +164,28 @@ pub async fn run_live_case(
     )?;
     *provenance_out = Some(provenance.clone());
 
+    let eval_config = zeroclaw_config::schema::Config::default();
+    let tools = zeroclaw_runtime::tools::scoped::ScopedToolRegistry::assemble(
+        zeroclaw_runtime::tools::scoped::ScopedAssembly {
+            config: &eval_config,
+            agent_alias: "eval",
+            security: &policy,
+            built: zeroclaw_runtime::tools::AllToolsResult::from_prebuilt_tools(tools),
+            skills: &[],
+            runtime: Arc::new(zeroclaw_runtime::platform::NativeRuntime::new()),
+            caller_allowed: None,
+            connect_mcp: false,
+            connect_peripherals: false,
+            exclude_memory: false,
+            acp_delivery: false,
+            list_deferred_mcp_specs: false,
+            emit_assembly_logs: false,
+            mcp_registry: None,
+        },
+    )
+    .await
+    .registry;
+
     // Empty allowlist -> None so the echo registry's own tool is usable; a
     // `Some(vec![])` would deny every tool including echo. Non-empty -> the
     // allowlist backs the already-filtered registry as defense in depth.
