@@ -596,12 +596,22 @@ impl InFlightTaskCompletion {
     }
 }
 
-fn conversation_memory_key(history_key: &str, message_id: &str) -> String {
-    // The runtime history key is the canonical conversation identity: it
-    // already includes the resolved channel alias, reply target, sender, and
-    // thread policy. Appending the transport message ID keeps each autosave
-    // row unique without rebuilding a competing identity from message fields.
-    sanitize_session_key(&format!("{history_key}_{message_id}"))
+fn conversation_memory_key_in_scope(
+    msg: &zeroclaw_api::channel::ChannelMessage,
+    channel_scope: &str,
+) -> String {
+    // Preserve the established autosave identity shape. Only the channel
+    // scope is resolved separately so multi-listener webhooks can add the
+    // alias without changing the rest of the operator-visible key.
+    let raw = match &msg.thread_ts {
+        Some(tid) => format!("{channel_scope}_{tid}_{}_{}", msg.sender, msg.id),
+        None => format!("{channel_scope}_{}_{}", msg.sender, msg.id),
+    };
+    sanitize_session_key(&raw)
+}
+
+fn conversation_memory_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
+    conversation_memory_key_in_scope(msg, &msg.channel)
 }
 
 /// The channel prefix used in session/route keys: the channel type plus the
@@ -656,6 +666,25 @@ fn runtime_conversation_history_key(
         conversation_history_key_in_scope(msg, &msg.channel)
     } else {
         conversation_history_key(msg)
+    }
+}
+
+/// Resolve durable autosave identity from the live channel registry.
+///
+/// Existing unaliased channels and a sole webhook retain the established key
+/// shape. A multi-webhook registry has no bare `webhook` entry, so only that
+/// collision-prone case adds the trusted listener alias to the channel scope.
+fn runtime_conversation_memory_key(
+    ctx: &ChannelRuntimeContext,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> String {
+    if msg.channel == "webhook"
+        && msg.channel_alias.is_some()
+        && !ctx.channels_by_name.contains_key("webhook")
+    {
+        conversation_memory_key_in_scope(msg, &channel_scope(msg))
+    } else {
+        conversation_memory_key(msg)
     }
 }
 
@@ -6302,7 +6331,7 @@ async fn process_channel_message_body(
         && autosave_content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
         && !zeroclaw_memory::should_skip_autosave_content(&autosave_content)
     {
-        let autosave_key = conversation_memory_key(&history_key, &msg.id);
+        let autosave_key = runtime_conversation_memory_key(ctx.as_ref(), &msg);
         let _ = ctx
             .memory
             .store(
@@ -14882,6 +14911,13 @@ temperature = 0.3
             runtime_conversation_history_key(single_ctx.as_ref(), &single_msg),
             legacy_key
         );
+        let legacy_autosave_key = conversation_memory_key(&legacy_msg);
+        assert_eq!(legacy_autosave_key, "webhook_alice_webhook_0");
+        assert_eq!(
+            runtime_conversation_memory_key(single_ctx.as_ref(), &single_msg),
+            legacy_autosave_key,
+            "a sole webhook must retain the established operator-visible autosave key"
+        );
 
         let mut passive_single_msg = single_msg.clone();
         passive_single_msg.passive_context = true;
@@ -15081,8 +15117,9 @@ temperature = 0.3
         let alpha_history_key =
             runtime_conversation_history_key(resolved_alpha.as_ref(), &alpha_msg);
         let beta_history_key = runtime_conversation_history_key(resolved_beta.as_ref(), &beta_msg);
-        let alpha_autosave_key = conversation_memory_key(&alpha_history_key, &alpha_msg.id);
-        let beta_autosave_key = conversation_memory_key(&beta_history_key, &beta_msg.id);
+        let alpha_autosave_key =
+            runtime_conversation_memory_key(resolved_alpha.as_ref(), &alpha_msg);
+        let beta_autosave_key = runtime_conversation_memory_key(resolved_beta.as_ref(), &beta_msg);
         assert_ne!(alpha_history_key, beta_history_key);
         assert_ne!(alpha_autosave_key, beta_autosave_key);
 
@@ -25421,11 +25458,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ..Default::default()
         };
 
-        let history_key = conversation_history_key(&msg);
-        assert_eq!(
-            conversation_memory_key(&history_key, &msg.id),
-            "slack_C456_U123_msg_abc123"
-        );
+        assert_eq!(conversation_memory_key(&msg), "slack_U123_msg_abc123");
     }
 
     #[test]
@@ -26800,11 +26833,9 @@ BTC is currently around $65,000 based on latest tool output."#
             ..Default::default()
         };
 
-        let history_key = conversation_history_key(&msg1);
-        assert_eq!(history_key, conversation_history_key(&msg2));
         assert_ne!(
-            conversation_memory_key(&history_key, &msg1.id),
-            conversation_memory_key(&history_key, &msg2.id)
+            conversation_memory_key(&msg1),
+            conversation_memory_key(&msg2)
         );
     }
 
@@ -26844,10 +26875,8 @@ BTC is currently around $65,000 based on latest tool output."#
             ..Default::default()
         };
 
-        let msg1_history_key = conversation_history_key(&msg1);
-        let msg2_history_key = conversation_history_key(&msg2);
         mem.store(
-            &conversation_memory_key(&msg1_history_key, &msg1.id),
+            &conversation_memory_key(&msg1),
             &msg1.content,
             MemoryCategory::Conversation,
             None,
@@ -26855,7 +26884,7 @@ BTC is currently around $65,000 based on latest tool output."#
         .await
         .unwrap();
         mem.store(
-            &conversation_memory_key(&msg2_history_key, &msg2.id),
+            &conversation_memory_key(&msg2),
             &msg2.content,
             MemoryCategory::Conversation,
             None,
@@ -26919,7 +26948,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let history_key = conversation_history_key(&msg);
 
         mem.store(
-            &conversation_memory_key(&history_key, &msg.id),
+            &conversation_memory_key(&msg),
             &msg.content,
             MemoryCategory::Conversation,
             Some(&history_key),
@@ -26976,7 +27005,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let group_b_history_key = conversation_history_key(&group_b_msg);
 
         mem.store(
-            &conversation_memory_key(&group_a_history_key, &group_a_msg.id),
+            &conversation_memory_key(&group_a_msg),
             &group_a_msg.content,
             MemoryCategory::Conversation,
             Some(&group_a_history_key),
