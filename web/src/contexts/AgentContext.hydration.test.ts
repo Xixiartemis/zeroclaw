@@ -95,7 +95,11 @@ test('mounted provider keeps one persisted:false notice when server hydration is
         JSON.stringify({
           session_persistence: true,
           // The backend retained the user row but missed the terminal notice.
-          messages: [{ role: 'user', content: 'large request' }],
+          messages: [
+            { role: 'user', content: 'large request', created_at: '2026-08-24T00:00:00Z' },
+            { role: 'user', content: 'later request', created_at: '2026-08-24T00:00:02Z' },
+            { role: 'assistant', content: 'later response', created_at: '2026-08-24T00:00:03Z' },
+          ],
         }),
         { status: 200, headers: { 'content-type': 'application/json' } },
       );
@@ -146,6 +150,8 @@ test('mounted provider keeps one persisted:false notice when server hydration is
     [
       { role: 'user', content: 'large request', notice: undefined },
       { role: 'agent', content: NOTICE, notice: true },
+      { role: 'user', content: 'later request', notice: undefined },
+      { role: 'agent', content: 'later response', notice: undefined },
     ],
   );
   assert.equal(observed.filter((message) => message.content === NOTICE).length, 1);

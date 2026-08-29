@@ -44,14 +44,17 @@ export function saveChatHistory(sessionId: string, messages: PersistedChatBubble
   }
 }
 
-/** Map server-persisted rows into UI messages (timestamps are synthetic for ordering). */
+/** Map server-persisted rows into UI messages, preserving durable ordering when available. */
 export function mapServerMessagesToPersisted(rows: SessionMessageRow[]): PersistedChatBubble[] {
   const base = Date.now() - rows.length * 1000;
   const out: PersistedChatBubble[] = [];
   let idx = 0;
   for (const row of rows) {
     if (row.role === 'system') continue;
-    const ts = new Date(base + idx * 1000).toISOString();
+    const parsedCreatedAt = row.created_at === null ? Number.NaN : Date.parse(row.created_at);
+    const ts = Number.isFinite(parsedCreatedAt)
+      ? new Date(parsedCreatedAt).toISOString()
+      : new Date(base + idx * 1000).toISOString();
     idx += 1;
     if (row.role === 'user') {
       out.push({
@@ -147,30 +150,80 @@ export function uiMessagesToPersisted(
  * its notice as locally durable; server hydration must not erase it merely
  * because a session backend exists but missed that message.
  *
- * Matching uses a multiset so repeated context-exhaustion turns remain
- * distinct while a notice already present on the server is not duplicated.
+ * Each local notice is anchored to the preceding local user turn and matched
+ * to the corresponding server user occurrence. This keeps a missed notice
+ * before later turns and prevents an unrelated identical assistant message
+ * from consuming the fallback.
  */
 export function mergeServerHistoryWithLocalNotices(
   server: PersistedChatBubble[],
   local: PersistedChatBubble[],
 ): PersistedChatBubble[] {
-  const serverNoticeCounts = new Map<string, number>();
-  for (const message of server) {
-    const key = `${message.role}\0${message.content}`;
-    serverNoticeCounts.set(key, (serverNoticeCounts.get(key) ?? 0) + 1);
-  }
-
-  const retained: PersistedChatBubble[] = [];
-  for (const message of local) {
+  const insertions = new Map<number, PersistedChatBubble[]>();
+  const matchedServerNotices = new Set<number>();
+  for (let localIndex = 0; localIndex < local.length; localIndex += 1) {
+    const message = local[localIndex];
+    if (!message) continue;
     if (message.notice !== true) continue;
-    const key = `${message.role}\0${message.content}`;
-    const serverCount = serverNoticeCounts.get(key) ?? 0;
-    if (serverCount > 0) {
-      serverNoticeCounts.set(key, serverCount - 1);
-    } else {
-      retained.push(message);
+
+    let localAnchorIndex = localIndex - 1;
+    while (localAnchorIndex >= 0 && local[localAnchorIndex]?.role !== 'user') {
+      localAnchorIndex -= 1;
     }
+    const localAnchor = local[localAnchorIndex];
+    if (!localAnchor) {
+      const at = server.length;
+      insertions.set(at, [...(insertions.get(at) ?? []), message]);
+      continue;
+    }
+
+    let anchorOccurrence = 0;
+    for (let index = 0; index <= localAnchorIndex; index += 1) {
+      const candidate = local[index];
+      if (candidate?.role === 'user' && candidate.content === localAnchor.content) {
+        anchorOccurrence += 1;
+      }
+    }
+
+    let seen = 0;
+    const serverAnchorIndex = server.findIndex((candidate) => {
+      if (candidate.role !== 'user' || candidate.content !== localAnchor.content) return false;
+      seen += 1;
+      return seen === anchorOccurrence;
+    });
+    if (serverAnchorIndex < 0) {
+      const at = server.length;
+      insertions.set(at, [...(insertions.get(at) ?? []), message]);
+      continue;
+    }
+
+    const nextTurnOffset = server
+      .slice(serverAnchorIndex + 1)
+      .findIndex((candidate) => candidate.role === 'user');
+    const nextTurnIndex =
+      nextTurnOffset < 0 ? server.length : serverAnchorIndex + 1 + nextTurnOffset;
+    const persistedNoticeIndex = server.findIndex(
+      (candidate, index) =>
+        index > serverAnchorIndex &&
+        index < nextTurnIndex &&
+        candidate.role === message.role &&
+        candidate.content === message.content &&
+        !matchedServerNotices.has(index),
+    );
+    if (persistedNoticeIndex >= 0) {
+      matchedServerNotices.add(persistedNoticeIndex);
+      continue;
+    }
+
+    insertions.set(nextTurnIndex, [...(insertions.get(nextTurnIndex) ?? []), message]);
   }
 
-  return retained.length === 0 ? server : [...server, ...retained];
+  if (insertions.size === 0) return server;
+  const merged: PersistedChatBubble[] = [];
+  for (let index = 0; index <= server.length; index += 1) {
+    merged.push(...(insertions.get(index) ?? []));
+    const current = server[index];
+    if (current) merged.push(current);
+  }
+  return merged;
 }

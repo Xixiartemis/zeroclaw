@@ -46,7 +46,10 @@ test('server hydration does not duplicate a terminal notice that was committed',
     bubble('server-user', 'user', 'large request'),
     bubble('server-notice', 'agent', NOTICE),
   ];
-  const local = [bubble('local-notice', 'agent', NOTICE, true)];
+  const local = [
+    bubble('local-user', 'user', 'large request'),
+    bubble('local-notice', 'agent', NOTICE, true),
+  ];
 
   const merged = mergeServerHistoryWithLocalNotices(server, local);
 
@@ -62,9 +65,15 @@ test('server hydration never resurrects ordinary local-only bubbles', () => {
 });
 
 test('matching is count-aware across repeated terminal notices', () => {
-  const server = [bubble('server-notice', 'agent', NOTICE)];
+  const server = [
+    bubble('server-user-1', 'user', 'same request'),
+    bubble('server-notice', 'agent', NOTICE),
+    bubble('server-user-2', 'user', 'same request'),
+  ];
   const local = [
+    bubble('local-user-1', 'user', 'same request'),
     bubble('local-notice-1', 'agent', NOTICE, true),
+    bubble('local-user-2', 'user', 'same request'),
     bubble('local-notice-2', 'agent', NOTICE, true),
   ];
 
@@ -72,4 +81,41 @@ test('matching is count-aware across repeated terminal notices', () => {
 
   assert.equal(merged.filter((message) => message.content === NOTICE).length, 2);
   assert.equal(merged[merged.length - 1]?.id, 'local-notice-2');
+});
+
+test('retained notice stays before a later persisted turn', () => {
+  const server = [
+    bubble('server-user-1', 'user', 'large request'),
+    bubble('server-user-2', 'user', 'later request'),
+    bubble('server-agent-2', 'agent', 'later response'),
+  ];
+  const local = [
+    bubble('local-user-1', 'user', 'large request'),
+    bubble('local-notice', 'agent', NOTICE, true),
+  ];
+
+  const merged = mergeServerHistoryWithLocalNotices(server, local);
+
+  assert.deepEqual(
+    merged.map(({ content }) => content),
+    ['large request', NOTICE, 'later request', 'later response'],
+  );
+});
+
+test('identical assistant text in a later turn cannot consume the retained notice', () => {
+  const server = [
+    bubble('server-user-1', 'user', 'large request'),
+    bubble('server-user-2', 'user', 'quote the warning'),
+    bubble('server-agent-2', 'agent', NOTICE),
+  ];
+  const local = [
+    bubble('local-user-1', 'user', 'large request'),
+    bubble('local-notice', 'agent', NOTICE, true),
+  ];
+
+  const merged = mergeServerHistoryWithLocalNotices(server, local);
+
+  assert.equal(merged.filter((message) => message.content === NOTICE).length, 2);
+  assert.equal(merged[1]?.id, 'local-notice');
+  assert.equal(merged[3]?.id, 'server-agent-2');
 });
