@@ -32,6 +32,7 @@ enum ProbeFailure {
 enum ProbeConfigFailure {
     Decryption,
     EnvironmentOverride(anyhow::Error),
+    Task(anyhow::Error),
 }
 
 impl ProbeFailure {
@@ -750,8 +751,16 @@ impl ModelRoutingConfigTool {
     ///
     /// This is a private working copy; the caller's `cfg` — and therefore
     /// what reaches disk — is untouched.
-    fn effective_config_for_probe(cfg: &Config) -> Result<Config, ProbeConfigFailure> {
-        let mut effective = cfg.clone();
+    async fn effective_config_for_probe(cfg: &Config) -> Result<Config, ProbeConfigFailure> {
+        let effective = cfg.clone();
+        tokio::task::spawn_blocking(move || Self::build_effective_config_for_probe(effective))
+            .await
+            .map_err(|error| ProbeConfigFailure::Task(anyhow::Error::new(error)))?
+    }
+
+    fn build_effective_config_for_probe(
+        mut effective: Config,
+    ) -> Result<Config, ProbeConfigFailure> {
         let zeroclaw_dir = effective
             .config_path
             .parent()
@@ -792,10 +801,12 @@ impl ModelRoutingConfigTool {
         // from the effective post-reload view of what was just saved — disk
         // decrypted, then the `ZEROCLAW_*` layer applied on top — rather than
         // from the pre-update runtime snapshot or from disk alone.
-        let mut effective = match Self::effective_config_for_probe(cfg) {
+        let mut effective = match Self::effective_config_for_probe(cfg).await {
             Ok(effective) => effective,
             Err(ProbeConfigFailure::Decryption) => return Ok(()),
-            Err(ProbeConfigFailure::EnvironmentOverride(error)) => {
+            Err(
+                ProbeConfigFailure::EnvironmentOverride(error) | ProbeConfigFailure::Task(error),
+            ) => {
                 return Err(ProbeFailure::Construction(error));
             }
         };
@@ -2011,7 +2022,7 @@ mod tests {
         let effective = {
             let _key = TestEnvVar::set(&_env_guard, key_var, "sk-ant-env-key");
             let _uri = TestEnvVar::set(&_env_guard, uri_var, "https://env.invalid/v1");
-            ModelRoutingConfigTool::effective_config_for_probe(&saved)
+            ModelRoutingConfigTool::effective_config_for_probe(&saved).await
         };
 
         let effective = effective.expect("effective config must build");
