@@ -64,8 +64,8 @@ pub fn write_setup_files(workspace: &Path, setup: &CaseSetup) -> anyhow::Result<
 
 /// Build the live tool registry. With no allowlisted tools, use the Phase 0 echo
 /// registry (a harmless deterministic tool). With an allowlist, build the runtime
-/// tools against an **enforcing** OS sandbox and filter them to the allowlist by
-/// name.
+/// tools and filter them by name. The shell is included only over an **enforcing**
+/// OS sandbox; non-spawning tools continue to use their argument-level guards.
 ///
 /// `zeroclaw_runtime::tools::default_tools` constructs `ShellTool::new`, which
 /// hardcodes a pass-through sandbox. Argument-level guards (`workspace_only`,
@@ -97,22 +97,25 @@ fn live_tool_registry_with_sandbox(
         return Ok(crate::tools::default_tools());
     }
 
-    let sandbox = make_sandbox(&policy.workspace_dir);
-    if !sandbox.is_enforcing() {
-        anyhow::bail!(
-            "live eval requires an enforcing sandbox backend for its tool registry; \
-             backend `{}` provides no OS-level filesystem confinement on this platform — \
-             rerun with an empty `live_allowed_tools`, or configure a sandbox backend",
-            sandbox.name()
-        );
-    }
+    let mut tools: Vec<Box<dyn Tool>> = Vec::new();
+    if effective.iter().any(|name| name == "shell") {
+        let sandbox = make_sandbox(&policy.workspace_dir);
+        if !sandbox.is_enforcing() {
+            anyhow::bail!(
+                "live eval requires an enforcing sandbox backend for its shell tool; \
+                 backend `{}` provides no OS-level filesystem confinement on this platform — \
+                 remove `shell` from `live_allowed_tools`, or configure a sandbox backend",
+                sandbox.name()
+            );
+        }
 
-    let runtime: Arc<dyn RuntimeAdapter> = Arc::new(NativeRuntime::new());
-    let shell = ShellTool::new_with_sandbox(policy.clone(), runtime, sandbox);
-    let mut tools: Vec<Box<dyn Tool>> = vec![Box::new(RateLimitedTool::new(
-        PathGuardedTool::new(shell, policy.clone()),
-        policy.clone(),
-    ))];
+        let runtime: Arc<dyn RuntimeAdapter> = Arc::new(NativeRuntime::new());
+        let shell = ShellTool::new_with_sandbox(policy.clone(), runtime, sandbox);
+        tools.push(Box::new(RateLimitedTool::new(
+            PathGuardedTool::new(shell, policy.clone()),
+            policy.clone(),
+        )));
+    }
     // Non-shell tools carry no OS-spawn surface; take them from the default
     // registry so the allowlist keeps working for `file_read`, `file_write`, etc.
     tools.extend(
@@ -420,6 +423,24 @@ mod tests {
             msg.contains("test-noop"),
             "error should name the backend: {msg}"
         );
+    }
+
+    /// Tools that never spawn a process remain usable on platforms without an
+    /// OS sandbox. Their filesystem boundary is enforced by `PathGuardedTool`;
+    /// requiring a shell sandbox here would reject safe file-only evaluations.
+    #[test]
+    fn non_shell_allowlist_does_not_require_os_sandbox() {
+        let tmp = tempfile::tempdir().unwrap();
+        let effective = vec!["file_write".to_string()];
+        let policy = live_policy(tmp.path(), &effective);
+
+        let registry = live_tool_registry_with_sandbox(&effective, policy, |_| {
+            panic!("a non-shell allowlist must not construct an OS sandbox")
+        })
+        .expect("file-only live registry should build");
+
+        assert_eq!(registry.len(), 1);
+        assert_eq!(registry[0].name(), "file_write");
     }
 
     /// The pass-through sandbox must not claim confinement — this is the
