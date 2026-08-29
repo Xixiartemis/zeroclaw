@@ -555,7 +555,7 @@ impl RpcDispatcher {
     /// The queue guard held by an in-flight turn is released only after its
     /// provider/tool future has observed cancellation and returned, so a
     /// replacement connection cannot race invisible old-generation work.
-    async fn shutdown(&mut self) {
+    pub(crate) async fn shutdown(&mut self) {
         self.connection_cancel.cancel();
         for task in self.prompt_tasks.drain(..) {
             let _ = task.await;

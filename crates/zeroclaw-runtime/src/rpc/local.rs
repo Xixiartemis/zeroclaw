@@ -226,7 +226,16 @@ pub async fn run_local_listener(
                         peer,
                         conn_cancel.clone(),
                     );
-                    dispatcher.run_connection(&mut transport).await;
+                    tokio::select! {
+                        _ = dispatcher.run(&mut transport) => {}
+                        _ = conn_cancel.cancelled() => {}
+                    }
+                    // Keep this sequencing in the connection task instead of
+                    // wrapping it in `RpcDispatcher::run_connection`: the
+                    // dispatcher request future is large enough that the
+                    // extra nested async frame can overflow Tokio's normal
+                    // worker stack in ordinary local-listener tests.
+                    dispatcher.shutdown().await;
 
                     if let Some(tui_id) = dispatcher.tui_id() {
                         ctx.tui_registry.unregister(tui_id);
@@ -1469,21 +1478,9 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn reload_drains_running_and_queued_prompts_for_local_connection_generation() {
-        std::thread::Builder::new()
-            .name("local-connection-generation".to_string())
-            .stack_size(8 * 1024 * 1024)
-            .spawn(|| {
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap()
-                    .block_on(assert_reload_drains_local_connection_generation());
-            })
-            .unwrap()
-            .join()
-            .expect("local connection generation test thread should not panic");
+    #[tokio::test]
+    async fn reload_drains_running_and_queued_prompts_for_local_connection_generation() {
+        assert_reload_drains_local_connection_generation().await;
     }
 
     #[tokio::test]
