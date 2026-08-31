@@ -30018,6 +30018,13 @@ This is an example JSON object for profile settings."#;
     #[test]
     fn resolve_agent_transcription_provider_empty_when_owner_has_no_preference() {
         let mut config = Config::default();
+        config.channels.voice_wake.insert(
+            "frontdoor".to_string(),
+            zeroclaw_config::schema::VoiceWakeConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
         config.agents.insert(
             "wake-agent".to_string(),
             zeroclaw_config::schema::AliasedAgentConfig {
@@ -30033,7 +30040,7 @@ This is an example JSON object for profile settings."#;
 
     #[cfg(feature = "voice-wake")]
     #[test]
-    fn voice_wake_provider_uses_same_canonical_co_owner_as_router() {
+    fn voice_wake_provider_fails_closed_with_ambiguous_owners() {
         let mut config = Config::default();
         config.agents.clear();
         config.channels.voice_wake.insert(
@@ -30066,13 +30073,10 @@ This is an example JSON object for profile settings."#;
             .active_agent_channel_bindings()
             .owner_by_channel_key();
 
-        assert_eq!(
-            owners.get("voice_wake.frontdoor").map(String::as_str),
-            Some("zeta")
-        );
+        assert_eq!(owners.get("voice_wake.frontdoor").map(String::as_str), None);
         assert_eq!(
             resolve_agent_transcription_provider(&config, "voice_wake.frontdoor"),
-            "groq.primary"
+            ""
         );
     }
 
@@ -31767,6 +31771,13 @@ This is an example JSON object for profile settings."#;
                 channels: vec![zeroclaw_config::providers::ChannelRef(
                     "telegram.default".to_string(),
                 )],
+                ..Default::default()
+            },
+        );
+        config.channels.telegram.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::TelegramConfig {
+                enabled: true,
                 ..Default::default()
             },
         );
