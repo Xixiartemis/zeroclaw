@@ -184,6 +184,7 @@ pub fn live_shell_sandbox(workspace: &Path) -> anyhow::Result<Arc<dyn Sandbox>> 
         },
         "native",
         Some(workspace),
+        &zeroclaw_runtime::security::SandboxExtraRoots::default(),
     );
     ensure_real_sandbox(sandbox.as_ref())?;
     Ok(sandbox)
@@ -409,7 +410,7 @@ mod tests {
         // `crate::agent::turn::approval_gate::gate_tool_approval`'s `Deny`
         // path, which returns straight to `prepare_tool_calls` without
         // touching the observer). The real proof the call never ran is in
-        // the fed-back conversation history: a "Denied by user." tool
+        // the fed-back conversation history: the non-interactive policy-denial
         // result, not any shell output.
         let trace: LlmTrace = serde_json::from_str(
             r#"{ "model_name": "shell-denied", "turns": [{ "user_input": "hi" }], "tools": ["shell"] }"#,
@@ -438,7 +439,10 @@ mod tests {
             matches!(
                 msg,
                 ConversationMessage::ToolResults(results)
-                    if results.iter().any(|r| r.content == "Denied by user.")
+                    if results.iter().any(|r| {
+                        r.content.contains("no operator decision was available")
+                            && r.content.contains("runtime denied it by policy")
+                    })
             )
         });
         assert!(
