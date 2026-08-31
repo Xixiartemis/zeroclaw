@@ -31202,13 +31202,8 @@ This is an example JSON object for profile settings."#;
         let sent = channel_impl.sent_messages.lock().await;
         assert_eq!(sent.len(), 1, "expected exactly one reply message");
         assert!(
-            sent[0].contains("does not support vision"),
-            "reply must mention vision capability error, got: {}",
-            sent[0]
-        );
-        assert!(
-            sent[0].contains("⚠️ Error"),
-            "reply must start with error prefix, got: {}",
+            sent[0].contains("⚠️ Error: "),
+            "reply must contain the error prefix, got: {}",
             sent[0]
         );
     }
@@ -31344,8 +31339,8 @@ This is an example JSON object for profile settings."#;
         let sent = channel_impl.sent_messages.lock().await;
         assert_eq!(sent.len(), 2, "expected one error and one successful reply");
         assert!(
-            sent[0].contains("does not support vision"),
-            "first reply must mention vision capability error, got: {}",
+            sent[0].contains("⚠️ Error: "),
+            "first reply must be the localized error response, got: {}",
             sent[0]
         );
         assert!(

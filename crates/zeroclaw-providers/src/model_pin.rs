@@ -287,6 +287,10 @@ mod tests {
             }
         }
 
+        fn vision_limited_by(&self, model: &str) -> Option<String> {
+            (model == "pinned-model").then(|| "fallback.alias".to_string())
+        }
+
         fn has_mixed_native_tool_support_for_model(&self, model: &str) -> bool {
             model == "pinned-model"
         }
@@ -318,6 +322,13 @@ mod tests {
         assert!(
             provider.has_mixed_native_tool_support_for_model("ignored-request-model"),
             "mixed-chain detection must be queried with the pinned model"
+        );
+        assert_eq!(
+            provider
+                .vision_limited_by("ignored-request-model")
+                .as_deref(),
+            Some("fallback.alias"),
+            "vision attribution must be queried with the pinned model"
         );
     }
 

@@ -535,6 +535,10 @@ mod tests {
         fn supports_vision(&self) -> bool {
             self.vision
         }
+
+        fn vision_limited_by(&self, model: &str) -> Option<String> {
+            Some(format!("limiter-for-{model}"))
+        }
     }
     impl ::zeroclaw_api::attribution::Attributable for MockModelProvider {
         fn role(&self) -> ::zeroclaw_api::attribution::Role {
@@ -893,6 +897,19 @@ mod tests {
 
         // Route should not exist
         assert!(!router.routes.contains_key("broken"));
+    }
+
+    #[test]
+    fn vision_attribution_uses_the_hinted_route_model() {
+        let (router, _) = make_router(
+            vec![("default", "default"), ("vision", "vision")],
+            vec![("images", "vision", "routed-vision-model")],
+        );
+
+        assert_eq!(
+            router.vision_limited_by("hint:images").as_deref(),
+            Some("limiter-for-routed-vision-model")
+        );
     }
 
     #[tokio::test]

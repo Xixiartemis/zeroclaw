@@ -433,10 +433,14 @@ vision = false
         .err()
         .expect("a non-vision aggregate with no vision route must surface a capability error");
 
+        let capability_error = err
+            .downcast_ref::<ProviderCapabilityError>()
+            .expect("vision refusal must retain its structured capability error");
+        assert_eq!(capability_error.model_provider, "primary");
+        assert_eq!(capability_error.capability, "vision");
         assert!(
-            err.to_string()
-                .contains("fallback model_provider=zai.default does not support vision input"),
-            "expected the fallback-named capability error, got: {err}"
+            capability_error.message.contains("zai.default"),
+            "the localized refusal must name the limiting fallback: {capability_error}"
         );
     }
 
@@ -485,10 +489,14 @@ vision = false
         .err()
         .expect("a non-vision primary with no vision route must surface a capability error");
 
+        let capability_error = err
+            .downcast_ref::<ProviderCapabilityError>()
+            .expect("vision refusal must retain its structured capability error");
+        assert_eq!(capability_error.model_provider, "primary");
+        assert_eq!(capability_error.capability, "vision");
         assert!(
-            err.to_string()
-                .contains("but this model_provider does not support vision input"),
-            "expected the original unnamed-primary wording, got: {err}"
+            !capability_error.message.is_empty(),
+            "the localized primary-provider refusal must remain user-visible"
         );
     }
 
