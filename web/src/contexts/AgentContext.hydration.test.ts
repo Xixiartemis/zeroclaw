@@ -240,7 +240,7 @@ test('mounted provider commits a failed terminal partial and restores it on relo
     renderer = mount();
     await new Promise((resolve) => setTimeout(resolve, 0));
   });
-  const socket = FakeWebSocket.instances.at(-1);
+  const socket = FakeWebSocket.instances[FakeWebSocket.instances.length - 1];
   assert.ok(socket, 'provider must create the chat WebSocket');
 
   await act(async () => {
@@ -251,8 +251,10 @@ test('mounted provider commits a failed terminal partial and restores it on relo
     socket.emit({ type: 'error', code: 'PROVIDER_ERROR', message: 'context overflow' });
   });
 
+  const liveContext = observed as ReturnType<typeof useAgent> | undefined;
+  assert.ok(liveContext, 'provider must expose the live chat context');
   assert.deepEqual(
-    observed?.messages.map(({ role, content, notice, terminalPartial }) => ({
+    liveContext.messages.map(({ role, content, notice, terminalPartial }) => ({
       role,
       content,
       notice,
@@ -264,7 +266,7 @@ test('mounted provider commits a failed terminal partial and restores it on relo
       { role: 'agent', content: NOTICE, notice: true, terminalPartial: undefined },
     ],
   );
-  assert.equal(observed?.streamingContent, '');
+  assert.equal(liveContext.streamingContent, '');
 
   await act(async () => renderer?.unmount());
   serverMessages = [
@@ -280,8 +282,10 @@ test('mounted provider commits a failed terminal partial and restores it on relo
     await new Promise((resolve) => setTimeout(resolve, 0));
   });
 
+  const reloadedContext = observed as ReturnType<typeof useAgent> | undefined;
+  assert.ok(reloadedContext, 'remounted provider must expose the hydrated context');
   assert.deepEqual(
-    observed?.messages.map(({ content, notice, terminalPartial }) => ({
+    reloadedContext.messages.map(({ content, notice, terminalPartial }) => ({
       content,
       notice,
       terminalPartial,
