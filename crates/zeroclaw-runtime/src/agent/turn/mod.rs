@@ -347,7 +347,7 @@ mod provider_image_quarantine_tests {
     #[test]
     fn ordinary_provider_error_does_not_quarantine_submitted_images() {
         let submitted = image_ids();
-        let error = anyhow::anyhow!("400 Bad Request: invalid tool schema");
+        let error = anyhow::Error::msg("400 Bad Request: invalid tool schema");
         let mut quarantine = ProviderImageQuarantine::default();
 
         retain_provider_image_rejection(&mut quarantine, &error, &submitted);
