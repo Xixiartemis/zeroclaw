@@ -399,6 +399,11 @@ pub struct Agent {
     /// the full conversation history on every turn and tool iteration.
     image_cache: zeroclaw_providers::multimodal::LocalImageCache,
     provider_switch_config: Option<ProviderSwitchConfig>,
+    /// Canonical live config handle for daemon-backed agents. Kept on Agent
+    /// rather than the public compatibility struct so callers constructing
+    /// `ProviderSwitchConfig` literals retain the established one-field API.
+    provider_switch_live_config:
+        Option<std::sync::Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
     /// Channel name stamped onto observer events to identify the calling surface
     /// (e.g. "agent", "wss", "gateway"). Defaults to "agent" for direct Agent callers.
     channel_name: String,
@@ -452,7 +457,6 @@ pub struct StreamedTurnError {
 #[derive(Clone, Debug, Default)]
 pub struct ProviderSwitchConfig {
     pub config: Option<std::sync::Arc<zeroclaw_config::schema::Config>>,
-    pub live_config: Option<std::sync::Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
 }
 
 /// Bundle of late-bound channel-map handles owned by an Agent. Cloning is
@@ -548,6 +552,8 @@ pub struct AgentBuilder {
     channel_name: Option<String>,
     exclude_memory: bool,
     provider_switch_config: Option<ProviderSwitchConfig>,
+    provider_switch_live_config:
+        Option<std::sync::Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
     #[cfg(test)]
     turn_datetime: Option<Arc<dyn Fn() -> chrono::DateTime<chrono::Local> + Send + Sync>>,
     #[cfg(test)]
@@ -601,6 +607,7 @@ impl AgentBuilder {
             channel_name: None,
             exclude_memory: false,
             provider_switch_config: None,
+            provider_switch_live_config: None,
             #[cfg(test)]
             turn_datetime: None,
             #[cfg(test)]
@@ -867,6 +874,14 @@ impl AgentBuilder {
         self
     }
 
+    fn provider_switch_live_config(
+        mut self,
+        config: Option<std::sync::Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
+    ) -> Self {
+        self.provider_switch_live_config = config;
+        self
+    }
+
     pub fn build(self) -> Result<Agent> {
         let mut tools = self.tools.ok_or_else(|| {
             ::zeroclaw_log::record!(
@@ -996,6 +1011,7 @@ impl AgentBuilder {
             channel_handles: AgentChannelHandles::default(),
             image_cache: zeroclaw_providers::multimodal::LocalImageCache::new(),
             provider_switch_config: self.provider_switch_config,
+            provider_switch_live_config: self.provider_switch_live_config,
             channel_name: self.channel_name.unwrap_or_else(|| "agent".to_string()),
             #[cfg(test)]
             turn_datetime: self.turn_datetime,
@@ -1015,10 +1031,9 @@ impl Agent {
     /// their construction snapshot. `None` is reserved for configless test
     /// builders.
     fn full_config_snapshot(&self) -> Option<Arc<zeroclaw_config::schema::Config>> {
-        let switch_config = self.provider_switch_config.as_ref()?;
-        match switch_config.live_config.as_ref() {
+        match self.provider_switch_live_config.as_ref() {
             Some(live_config) => Some(Arc::new(live_config.read().clone())),
-            None => switch_config.config.clone(),
+            None => self.provider_switch_config.as_ref()?.config.clone(),
         }
     }
 
@@ -1874,8 +1889,8 @@ impl Agent {
                 config: live_config
                     .is_none()
                     .then(|| std::sync::Arc::new(config.clone())),
-                live_config: live_config.clone(),
             })
+            .provider_switch_live_config(live_config.clone())
             .build()?;
 
         // Wire per-tool channel-map handles into the agent so callers (e.g.
@@ -2170,32 +2185,27 @@ impl Agent {
         );
 
         let switch_outcome: anyhow::Result<Box<dyn ModelProvider>> =
-            match self.provider_switch_config.as_ref() {
-                Some(switch_config)
-                    if switch_config.live_config.is_some() || switch_config.config.is_some() =>
-                {
-                    match switch_config.live_config.as_ref() {
-                        Some(live_config) => {
-                            zeroclaw_providers::create_model_switch_provider_with_live_config(
-                                Arc::clone(live_config),
-                                &new_model_provider,
-                                &new_model,
-                            )
-                        }
-                        None => zeroclaw_providers::create_model_switch_provider(
-                            switch_config
-                                .config
-                                .as_deref()
-                                .expect("guarded by match condition"),
-                            &new_model_provider,
-                            &new_model,
-                        ),
-                    }
-                }
-                _ => Err(anyhow::Error::msg(
-                    "model_switch requested but agent has no provider_switch_config; \
-                 cannot rebuild provider safely",
-                )),
+            if let Some(live_config) = self.provider_switch_live_config.as_ref() {
+                zeroclaw_providers::create_model_switch_provider_with_live_config(
+                    Arc::clone(live_config),
+                    &new_model_provider,
+                    &new_model,
+                )
+            } else if let Some(config) = self
+                .provider_switch_config
+                .as_ref()
+                .and_then(|switch| switch.config.as_deref())
+            {
+                zeroclaw_providers::create_model_switch_provider(
+                    config,
+                    &new_model_provider,
+                    &new_model,
+                )
+            } else {
+                Err(anyhow::Error::msg(
+                    "model_switch requested but agent has no provider switch config; \
+                     cannot rebuild provider safely",
+                ))
             };
 
         match switch_outcome {
@@ -3672,7 +3682,8 @@ mod tests {
             agent
                 .provider_switch_config
                 .as_ref()
-                .is_some_and(|switch| switch.config.is_none() && switch.live_config.is_some()),
+                .is_some_and(|switch| switch.config.is_none())
+                && agent.provider_switch_live_config.is_some(),
             "fixture must exercise a live-only ProviderSwitchConfig"
         );
         agent.model_provider = Box::new(LiveSopOuterProvider {
@@ -5933,10 +5944,8 @@ mod tests {
                     Some(Box::new(NativeToolDispatcher)),
                     Some(multimodal),
                 );
-                agent.provider_switch_config = Some(ProviderSwitchConfig {
-                    config: None,
-                    live_config: Some(live_config),
-                });
+                agent.provider_switch_config = Some(ProviderSwitchConfig { config: None });
+                agent.provider_switch_live_config = Some(live_config);
                 agent
             }
 
@@ -11835,6 +11844,13 @@ vision = true
     }
 
     #[test]
+    fn provider_switch_config_retains_one_field_literal_contract() {
+        let config = ProviderSwitchConfig { config: None };
+
+        assert!(config.config.is_none());
+    }
+
+    #[test]
     fn try_apply_model_switch_preserves_agent_without_switch_config() {
         // Agent has NO provider_switch_config — cannot rebuild provider.
         let mut agent = build_test_agent("openai", "gpt-4o-mini", None);
@@ -11862,7 +11878,6 @@ vision = true
             config: Some(std::sync::Arc::new(
                 zeroclaw_config::schema::Config::default(),
             )),
-            live_config: None,
         };
 
         let mut agent = build_test_agent("openai", "gpt-4o-mini", Some(switch_cfg));
@@ -11892,7 +11907,6 @@ vision = true
         let live_config = Arc::new(parking_lot::RwLock::new(startup.clone()));
         let switch_cfg = ProviderSwitchConfig {
             config: Some(Arc::new(startup)),
-            live_config: Some(Arc::clone(&live_config)),
         };
         live_config.write().providers.models.openai.insert(
             "live".to_string(),
@@ -11906,6 +11920,7 @@ vision = true
         );
 
         let mut agent = build_test_agent("openai", "gpt-4o-mini", Some(switch_cfg));
+        agent.provider_switch_live_config = Some(Arc::clone(&live_config));
         let result = agent.try_apply_model_switch(
             "gpt-4o-mini",
             "openai.live".to_string(),
@@ -11922,7 +11937,6 @@ vision = true
             config: Some(std::sync::Arc::new(
                 zeroclaw_config::schema::Config::default(),
             )),
-            live_config: None,
         };
 
         let mut agent = build_test_agent("openai", "shared-name", Some(switch_cfg));
@@ -11959,7 +11973,6 @@ vision = true
         };
         let switch_cfg = ProviderSwitchConfig {
             config: Some(std::sync::Arc::new(route_config)),
-            live_config: None,
         };
 
         let mut agent = build_test_agent("openai", "gpt-4o-mini", Some(switch_cfg));
@@ -12054,11 +12067,9 @@ vision = true
             },
         ];
         let live_config = Arc::new(parking_lot::RwLock::new(config));
-        let switch_cfg = ProviderSwitchConfig {
-            config: None,
-            live_config: Some(Arc::clone(&live_config)),
-        };
+        let switch_cfg = ProviderSwitchConfig { config: None };
         let mut agent = build_test_agent("openai", "gpt-4o-mini", Some(switch_cfg));
+        agent.provider_switch_live_config = Some(Arc::clone(&live_config));
 
         let result = agent.try_apply_model_switch(
             "gpt-4o-mini",
@@ -12159,11 +12170,9 @@ vision = true
             },
         );
         let live_config = Arc::new(parking_lot::RwLock::new(config));
-        let switch_cfg = ProviderSwitchConfig {
-            config: None,
-            live_config: Some(Arc::clone(&live_config)),
-        };
+        let switch_cfg = ProviderSwitchConfig { config: None };
         let mut agent = build_test_agent("openai.source", "source-model", Some(switch_cfg));
+        agent.provider_switch_live_config = Some(Arc::clone(&live_config));
         agent.agent_alias = "current".to_string();
 
         let result = agent.try_apply_model_switch(
@@ -12406,7 +12415,6 @@ vision = true
                 },
                 ..zeroclaw_config::schema::Config::default()
             })),
-            live_config: None,
         };
         let agent_config = zeroclaw_config::schema::AliasedAgentConfig {
             resolved: zeroclaw_config::schema::ResolvedRuntime {

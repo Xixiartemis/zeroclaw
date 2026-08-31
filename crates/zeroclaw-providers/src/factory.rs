@@ -520,6 +520,10 @@ pub(crate) fn rotation_credential_eligible(
         .filter(|value| !value.is_empty())
         .unwrap_or(family);
 
+    if matches!(provider_kind, "openai-codex" | "openai_codex" | "codex") {
+        return crate::openai_codex::api_key_is_outbound_credential(opts, key);
+    }
+
     if provider_kind == "openai" {
         let default_cfg = openai_missing_entry_fallback_config();
         let cfg = config
@@ -1499,12 +1503,12 @@ impl FamilyProviderFactory for BedrockModelProviderConfig {
 
     fn api_key_is_outbound_credential(
         &self,
-        _key: Option<&str>,
+        key: Option<&str>,
         _opts: &ModelProviderRuntimeOptions,
     ) -> bool {
-        // Bedrock authenticates through the ambient AWS credential chain, so a
-        // rotated key is not the wire credential.
-        false
+        // An explicit key selects Bedrock bearer-token authentication. With no
+        // key the builder keeps the ambient AWS/SigV4 credential chain.
+        has_api_key(key)
     }
 }
 
@@ -1990,6 +1994,54 @@ mod tests {
         assert!(endpoint_for_family("not_a_provider").is_none());
         assert!(endpoint_for_family("openai-compatible").is_none());
         assert!(endpoint_for_family("openai_compatible").is_none());
+    }
+
+    #[test]
+    fn bedrock_explicit_bearer_is_rotation_eligible() {
+        let options = ModelProviderRuntimeOptions::default();
+
+        assert!(rotation_credential_eligible(
+            None,
+            "bedrock",
+            "default",
+            Some("bedrock-api-key"),
+            &options,
+        ));
+        assert!(!rotation_credential_eligible(
+            None, "bedrock", "default", None, &options,
+        ));
+        assert!(!rotation_credential_eligible(
+            None,
+            "bedrock",
+            "default",
+            Some("  "),
+            &options,
+        ));
+    }
+
+    #[test]
+    fn legacy_codex_oauth_is_not_rotation_eligible_without_custom_endpoint() {
+        for family in ["openai-codex", "openai_codex", "codex"] {
+            assert!(!rotation_credential_eligible(
+                None,
+                family,
+                "default",
+                Some("stored-oauth-token"),
+                &ModelProviderRuntimeOptions::default(),
+            ));
+        }
+
+        let custom_endpoint = ModelProviderRuntimeOptions {
+            provider_api_url: Some("https://gateway.example.com/v1".to_string()),
+            ..Default::default()
+        };
+        assert!(rotation_credential_eligible(
+            None,
+            "openai-codex",
+            "default",
+            Some("gateway-api-key"),
+            &custom_endpoint,
+        ));
     }
 
     #[test]

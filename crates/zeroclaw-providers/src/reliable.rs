@@ -15,7 +15,6 @@ use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -2119,6 +2118,25 @@ impl ReliableModelProvider {
         self
     }
 
+    /// Preserve the legacy public builder surface.
+    ///
+    /// The former implementation retained these keys but could not apply them
+    /// because [`ModelProvider`] has no credential setter. Alias-aware factory
+    /// construction now owns effective rotation by attaching a typed rebuild
+    /// resolver before this wrapper is returned. Keeping this method as an
+    /// effective no-op preserves source and runtime compatibility for callers
+    /// that used the old builder without creating a parallel credential path.
+    pub fn with_api_keys(self, _keys: Vec<String>) -> Self {
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn primary_has_credential_rotation(&self) -> bool {
+        self.model_providers
+            .first()
+            .is_some_and(|entry| entry.credential_rotation.is_some())
+    }
+
     #[cfg(test)]
     pub fn with_model_fallbacks(mut self, fallbacks: HashMap<String, Vec<String>>) -> Self {
         self.model_fallbacks = fallbacks;
@@ -2611,15 +2629,13 @@ impl ModelProvider for ReliableModelProvider {
                                     .is_some_and(|binding| binding.credential.had_alternates);
                                 if selected_with_alternates || entry.can_rotate_credentials() {
                                     final_cause = Some(e);
-                                    final_cause_provider =
-                                        Some(entry.candidate_name().to_string());
+                                    final_cause_provider = Some(entry.candidate_name().to_string());
                                     break;
                                 }
                                 if self.model_providers.len() > 1 {
                                     self.cool_down_rate_limited_provider(entry, served_model, &e);
                                     final_cause = Some(e);
-                                    final_cause_provider =
-                                        Some(entry.candidate_name().to_string());
+                                    final_cause_provider = Some(entry.candidate_name().to_string());
                                     break;
                                 }
                             }
@@ -2948,15 +2964,13 @@ impl ModelProvider for ReliableModelProvider {
                                     .is_some_and(|binding| binding.credential.had_alternates);
                                 if selected_with_alternates || entry.can_rotate_credentials() {
                                     final_cause = Some(e);
-                                    final_cause_provider =
-                                        Some(entry.candidate_name().to_string());
+                                    final_cause_provider = Some(entry.candidate_name().to_string());
                                     break;
                                 }
                                 if self.model_providers.len() > 1 {
                                     self.cool_down_rate_limited_provider(entry, served_model, &e);
                                     final_cause = Some(e);
-                                    final_cause_provider =
-                                        Some(entry.candidate_name().to_string());
+                                    final_cause_provider = Some(entry.candidate_name().to_string());
                                     break;
                                 }
                             }
@@ -3381,15 +3395,13 @@ impl ModelProvider for ReliableModelProvider {
                                     .is_some_and(|binding| binding.credential.had_alternates);
                                 if selected_with_alternates || entry.can_rotate_credentials() {
                                     final_cause = Some(e);
-                                    final_cause_provider =
-                                        Some(entry.candidate_name().to_string());
+                                    final_cause_provider = Some(entry.candidate_name().to_string());
                                     break;
                                 }
                                 if self.model_providers.len() > 1 {
                                     self.cool_down_rate_limited_provider(entry, served_model, &e);
                                     final_cause = Some(e);
-                                    final_cause_provider =
-                                        Some(entry.candidate_name().to_string());
+                                    final_cause_provider = Some(entry.candidate_name().to_string());
                                     break;
                                 }
                             }
@@ -3735,15 +3747,13 @@ impl ModelProvider for ReliableModelProvider {
                                     .is_some_and(|binding| binding.credential.had_alternates);
                                 if selected_with_alternates || entry.can_rotate_credentials() {
                                     final_cause = Some(e);
-                                    final_cause_provider =
-                                        Some(entry.candidate_name().to_string());
+                                    final_cause_provider = Some(entry.candidate_name().to_string());
                                     break;
                                 }
                                 if self.model_providers.len() > 1 {
                                     self.cool_down_rate_limited_provider(entry, served_model, &e);
                                     final_cause = Some(e);
-                                    final_cause_provider =
-                                        Some(entry.candidate_name().to_string());
+                                    final_cause_provider = Some(entry.candidate_name().to_string());
                                     break;
                                 }
                             }
@@ -4263,7 +4273,16 @@ mod tests {
     use crate::router::{Route, RouterModelProvider};
     use futures_util::StreamExt;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use zeroclaw_api::tool::ToolSpec;
+
+    #[test]
+    fn legacy_api_key_builder_remains_source_compatible() {
+        let provider = ReliableModelProvider::new("test", Vec::new(), 0, 50)
+            .with_api_keys(vec!["legacy-key".to_string()]);
+
+        assert!(!provider.primary_has_credential_rotation());
+    }
 
     fn drain_captured_events(
         rx: &mut tokio::sync::broadcast::Receiver<serde_json::Value>,

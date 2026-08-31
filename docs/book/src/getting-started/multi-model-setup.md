@@ -35,7 +35,7 @@ For transient errors such as a network failure, `503`, or timeout, a non-streami
 
 ## Streaming recovery boundary
 
-A streaming call selects the first eligible, non-cooling entry that supports the required stream capabilities. It does not advance to another entry after that stream starts. If the stream fails before visible output reaches an immutable consumer, the runtime retries the whole call through the non-streaming path, which can walk the fallback graph. Once visible output exists, the runtime preserves the partial response and does not replay the request or switch providers. See [Provider routing lifecycle](../architecture/provider-routing-lifecycle.md#streaming-and-replay-boundary) for the complete contract.
+A streaming call selects the first eligible, non-cooling entry that supports the required stream capabilities. A retryable rate limit after the stream opens but before its first event may replace the credential on that same provider entry. Other pre-output failures can recover through the non-streaming path, which may walk the fallback graph. Once any event is visible, the runtime preserves the partial response and never replays the request with another credential, provider, or model. See [Provider routing lifecycle](../architecture/provider-routing-lifecycle.md#streaming-and-replay-boundary) for the complete contract.
 
 ## API key rotation
 

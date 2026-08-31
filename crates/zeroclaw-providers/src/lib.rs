@@ -1446,6 +1446,22 @@ pub fn create_resilient_model_provider_with_options(
     reliability: &zeroclaw_config::schema::ReliabilityConfig,
     options: &ModelProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn ModelProvider>> {
+    Ok(Box::new(build_resilient_model_provider_with_options(
+        primary_name,
+        api_key,
+        api_url,
+        reliability,
+        options,
+    )?))
+}
+
+fn build_resilient_model_provider_with_options(
+    primary_name: &str,
+    api_key: Option<&str>,
+    api_url: Option<&str>,
+    reliability: &zeroclaw_config::schema::ReliabilityConfig,
+    options: &ModelProviderRuntimeOptions,
+) -> anyhow::Result<ReliableModelProvider> {
     let primary_model_provider =
         create_model_provider_inner(None, primary_name, "default", api_key, api_url, options)?;
 
@@ -1461,7 +1477,7 @@ pub fn create_resilient_model_provider_with_options(
         reliable = reliable.with_credential_rotation(rotation);
     }
 
-    Ok(Box::new(reliable))
+    Ok(reliable)
 }
 
 /// Wrap the primary model_provider in a retry/backoff harness with full
@@ -6451,6 +6467,47 @@ mod tests {
     }
 
     // ── Credential rotation eligibility gating ──
+
+    #[test]
+    fn bare_codex_oauth_factory_path_does_not_attach_key_rotation() {
+        let reliability = zeroclaw_config::schema::ReliabilityConfig {
+            api_keys: vec!["extra-key".to_string()],
+            ..Default::default()
+        };
+
+        for provider_name in ["openai-codex", "openai_codex", "codex"] {
+            let provider = build_resilient_model_provider_with_options(
+                provider_name,
+                Some("stored-oauth-token"),
+                None,
+                &reliability,
+                &ModelProviderRuntimeOptions::default(),
+            )
+            .expect("legacy Codex OAuth construction must succeed");
+
+            assert!(
+                !provider.primary_has_credential_rotation(),
+                "default {provider_name} OAuth must not attach API-key rotation"
+            );
+        }
+
+        let custom_endpoint = ModelProviderRuntimeOptions {
+            provider_api_url: Some("https://gateway.example.com/v1".to_string()),
+            ..Default::default()
+        };
+        let gateway = build_resilient_model_provider_with_options(
+            "openai-codex",
+            Some("gateway-api-key"),
+            None,
+            &reliability,
+            &custom_endpoint,
+        )
+        .expect("custom Codex gateway construction must succeed");
+        assert!(
+            gateway.primary_has_credential_rotation(),
+            "a custom Codex gateway must retain API-key rotation"
+        );
+    }
 
     #[test]
     fn qwen_refresh_token_without_auth_mode_is_not_rotation_eligible() {
