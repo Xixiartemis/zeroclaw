@@ -479,7 +479,7 @@ impl InteractiveInputTask {
                             }
                         }
                     }
-                    result = &mut result => result?,
+                    result = &mut result => result??,
                 };
 
                 match line {
