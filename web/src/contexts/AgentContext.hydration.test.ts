@@ -44,17 +44,27 @@ class MemoryStorage implements Storage {
 
 class FakeWebSocket {
   static readonly OPEN = 1;
+  static readonly instances: FakeWebSocket[] = [];
   readonly readyState = FakeWebSocket.OPEN;
   onopen: (() => void) | null = null;
-  onmessage: (() => void) | null = null;
+  onmessage: ((event: { data: string }) => void) | null = null;
   onclose: (() => void) | null = null;
   onerror: (() => void) | null = null;
 
+  constructor() {
+    FakeWebSocket.instances.push(this);
+  }
+
   close(): void {}
   send(): void {}
+
+  emit(message: unknown): void {
+    this.onmessage?.({ data: JSON.stringify(message) });
+  }
 }
 
 test('mounted provider keeps one persisted:false notice when server hydration is incomplete', async () => {
+  FakeWebSocket.instances.length = 0;
   const storage = new MemoryStorage();
   Object.assign(globalThis, {
     IS_REACT_ACT_ENVIRONMENT: true,
@@ -96,7 +106,11 @@ test('mounted provider keeps one persisted:false notice when server hydration is
           session_persistence: true,
           // The backend retained the user row but missed the terminal notice.
           messages: [
-            { role: 'user', content: 'large request', created_at: '2026-08-24T00:00:00Z' },
+            {
+              role: 'user',
+              content: '[CURRENT DATE & TIME: 2026-08-24 00:00:00 UTC]\n\nlarge request',
+              created_at: '2026-08-24T00:00:00Z',
+            },
             { role: 'user', content: 'later request', created_at: '2026-08-24T00:00:02Z' },
             { role: 'assistant', content: 'later response', created_at: '2026-08-24T00:00:03Z' },
           ],
@@ -148,7 +162,11 @@ test('mounted provider keeps one persisted:false notice when server hydration is
   assert.deepEqual(
     observed.map(({ role, content, notice }) => ({ role, content, notice })),
     [
-      { role: 'user', content: 'large request', notice: undefined },
+      {
+        role: 'user',
+        content: '[CURRENT DATE & TIME: 2026-08-24 00:00:00 UTC]\n\nlarge request',
+        notice: undefined,
+      },
       { role: 'agent', content: NOTICE, notice: true },
       { role: 'user', content: 'later request', notice: undefined },
       { role: 'agent', content: 'later response', notice: undefined },
@@ -156,6 +174,128 @@ test('mounted provider keeps one persisted:false notice when server hydration is
   );
   assert.equal(observed.filter((message) => message.content === NOTICE).length, 1);
   assert.equal(loadChatHistory(SESSION_ID).filter((message) => message.content === NOTICE).length, 1);
+
+  await act(async () => renderer?.unmount());
+});
+
+test('mounted provider commits a failed terminal partial and restores it on reload', async () => {
+  const storage = new MemoryStorage();
+  const sessionId = 'terminal-partial-reload-session';
+  FakeWebSocket.instances.length = 0;
+  Object.assign(globalThis, {
+    IS_REACT_ACT_ENVIRONMENT: true,
+    localStorage: storage,
+    window: {
+      location: { protocol: 'http:', host: 'localhost' },
+      dispatchEvent: () => true,
+    },
+    WebSocket: FakeWebSocket,
+  });
+  storage.setItem('zeroclaw_session_id.default', sessionId);
+
+  let serverMessages: Array<{ role: string; content: string; created_at: string }> = [];
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (url.includes(`/api/sessions/${sessionId}/messages`)) {
+      return new Response(
+        JSON.stringify({ session_persistence: true, messages: serverMessages }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    }
+    if (url.includes('/api/config/catalog')) {
+      return new Response(JSON.stringify({ providers: [] }), { status: 200 });
+    }
+    if (url.includes('/api/status')) {
+      return new Response(JSON.stringify({ model: 'controlled', locale: 'en' }), { status: 200 });
+    }
+    if (url.includes('/api/config/prop')) {
+      return new Response(JSON.stringify({ path: 'agent', value: '<unset>' }), { status: 200 });
+    }
+    if (url.includes('/api/config/resolve-alias-source')) {
+      return new Response(JSON.stringify({ source: 'model_providers', values: [] }), {
+        status: 200,
+      });
+    }
+    return new Response('{}', { status: 200 });
+  };
+
+  const { AgentProvider, useAgent } = await import('./AgentContext.tsx');
+  let observed: ReturnType<typeof useAgent> | undefined;
+  function Probe() {
+    const context = useAgent();
+    useEffect(() => {
+      observed = context;
+    }, [context]);
+    return null;
+  }
+  const mount = () => create(
+    createElement(
+      AgentProvider,
+      { agentAlias: 'default', children: createElement(Probe) },
+    ),
+  );
+
+  let renderer: ReactTestRenderer | undefined;
+  await act(async () => {
+    renderer = mount();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
+  const socket = FakeWebSocket.instances.at(-1);
+  assert.ok(socket, 'provider must create the chat WebSocket');
+
+  await act(async () => {
+    socket.onopen?.();
+    observed?.sendMessage('large request');
+    socket.emit({ type: 'chunk', content: 'partial answer' });
+    socket.emit({ type: 'context_exhausted', notice: NOTICE, persisted: false });
+    socket.emit({ type: 'error', code: 'PROVIDER_ERROR', message: 'context overflow' });
+  });
+
+  assert.deepEqual(
+    observed?.messages.map(({ role, content, notice, terminalPartial }) => ({
+      role,
+      content,
+      notice,
+      terminalPartial,
+    })),
+    [
+      { role: 'user', content: 'large request', notice: undefined, terminalPartial: undefined },
+      { role: 'agent', content: 'partial answer', notice: undefined, terminalPartial: true },
+      { role: 'agent', content: NOTICE, notice: true, terminalPartial: undefined },
+    ],
+  );
+  assert.equal(observed?.streamingContent, '');
+
+  await act(async () => renderer?.unmount());
+  serverMessages = [
+    {
+      role: 'user',
+      content: '[CURRENT DATE & TIME: 2026-08-24 00:00:00 UTC]\n\nlarge request',
+      created_at: '2026-08-24T00:00:00Z',
+    },
+  ];
+  observed = undefined;
+  await act(async () => {
+    renderer = mount();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
+
+  assert.deepEqual(
+    observed?.messages.map(({ content, notice, terminalPartial }) => ({
+      content,
+      notice,
+      terminalPartial,
+    })),
+    [
+      {
+        content: '[CURRENT DATE & TIME: 2026-08-24 00:00:00 UTC]\n\nlarge request',
+        notice: undefined,
+        terminalPartial: undefined,
+      },
+      { content: 'partial answer', notice: undefined, terminalPartial: true },
+      { content: NOTICE, notice: true, terminalPartial: undefined },
+    ],
+  );
 
   await act(async () => renderer?.unmount());
 });

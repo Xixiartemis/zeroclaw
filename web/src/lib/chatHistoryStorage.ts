@@ -12,6 +12,9 @@ export interface PersistedChatBubble {
   markdown?: boolean;
   /** Trusted lifecycle marker retained for a locally durable terminal notice. */
   notice?: boolean;
+  /** Streamed assistant output retained only when the terminal frame reports
+   *  that the canonical failed-turn delta was not fully persisted. */
+  terminalPartial?: boolean;
   /** Verbatim locally-composed user input — never gateway-prefixed, so the
    *  bubble skips stripServerTimestamp for it. (Server rows omit this.) */
   local?: boolean;
@@ -93,6 +96,7 @@ export function persistedToUiMessages(
   thinking?: string;
   markdown?: boolean;
   notice?: boolean;
+  terminalPartial?: boolean;
   local?: boolean;
   toolCall?: { name: string; args?: unknown; output?: string };
   timestamp: Date;
@@ -104,6 +108,7 @@ export function persistedToUiMessages(
     thinking: m.thinking,
     markdown: m.markdown,
     notice: m.notice,
+    terminalPartial: m.terminalPartial,
     local: m.local,
     toolCall: m.toolCall,
     timestamp: new Date(m.timestamp),
@@ -118,6 +123,7 @@ export function uiMessagesToPersisted(
     thinking?: string;
     markdown?: boolean;
     notice?: boolean;
+    terminalPartial?: boolean;
     local?: boolean;
     ephemeral?: boolean;
     toolCall?: { name: string; args?: unknown; output?: string };
@@ -136,6 +142,7 @@ export function uiMessagesToPersisted(
       thinking: m.thinking,
       markdown: m.markdown,
       notice: m.notice,
+      terminalPartial: m.terminalPartial,
       // Preserve the verbatim-user-input flag so reloaded bubbles still skip
       // server-timestamp stripping.
       local: m.local,
@@ -155,12 +162,34 @@ export function uiMessagesToPersisted(
  * before later turns and prevents an unrelated identical assistant message
  * from consuming the fallback.
  */
+const RUNTIME_USER_ENVELOPE_RE =
+  /^\[CURRENT DATE & TIME: [^\]\r\n]+\]\r?\n\r?\n/;
+
+/** Resolve a persisted runtime user row to the verbatim ingress content used
+ *  by the web composer. Only the runtime-owned leading envelope is removed;
+ *  a matching-looking string inside the message remains ordinary content. */
+function rawServerUserContent(content: string): string {
+  return content.replace(RUNTIME_USER_ENVELOPE_RE, '');
+}
+
+function sameUserOccurrence(
+  serverMessage: PersistedChatBubble,
+  localMessage: PersistedChatBubble,
+): boolean {
+  return serverMessage.role === 'user'
+    && rawServerUserContent(serverMessage.content) === localMessage.content;
+}
+
+function isRetainedTerminalMessage(message: PersistedChatBubble): boolean {
+  return message.notice === true || message.terminalPartial === true;
+}
+
 export function mergeServerHistoryWithLocalNotices(
   server: PersistedChatBubble[],
   local: PersistedChatBubble[],
 ): PersistedChatBubble[] {
   const insertions = new Map<number, PersistedChatBubble[]>();
-  const matchedServerNotices = new Set<number>();
+  const matchedServerMessages = new Set<number>();
   for (let localIndex = 0; localIndex < local.length; localIndex += 1) {
     const message = local[localIndex];
     if (!message) continue;
@@ -171,51 +200,66 @@ export function mergeServerHistoryWithLocalNotices(
       localAnchorIndex -= 1;
     }
     const localAnchor = local[localAnchorIndex];
-    if (!localAnchor) {
-      const at = server.length;
-      insertions.set(at, [...(insertions.get(at) ?? []), message]);
-      continue;
-    }
-
-    let anchorOccurrence = 0;
-    for (let index = 0; index <= localAnchorIndex; index += 1) {
-      const candidate = local[index];
-      if (candidate?.role === 'user' && candidate.content === localAnchor.content) {
-        anchorOccurrence += 1;
+    let serverAnchorIndex = -1;
+    if (localAnchor) {
+      let anchorOccurrence = 0;
+      for (let index = 0; index <= localAnchorIndex; index += 1) {
+        const candidate = local[index];
+        if (candidate?.role === 'user' && candidate.content === localAnchor.content) {
+          anchorOccurrence += 1;
+        }
       }
+
+      let seen = 0;
+      serverAnchorIndex = server.findIndex((candidate) => {
+        if (!sameUserOccurrence(candidate, localAnchor)) return false;
+        seen += 1;
+        return seen === anchorOccurrence;
+      });
     }
 
-    let seen = 0;
-    const serverAnchorIndex = server.findIndex((candidate) => {
-      if (candidate.role !== 'user' || candidate.content !== localAnchor.content) return false;
-      seen += 1;
-      return seen === anchorOccurrence;
-    });
-    if (serverAnchorIndex < 0) {
-      const at = server.length;
-      insertions.set(at, [...(insertions.get(at) ?? []), message]);
-      continue;
-    }
+    const nextTurnOffset = serverAnchorIndex < 0
+      ? -1
+      : server
+        .slice(serverAnchorIndex + 1)
+        .findIndex((candidate) => candidate.role === 'user');
+    const nextTurnIndex = serverAnchorIndex < 0 || nextTurnOffset < 0
+      ? server.length
+      : serverAnchorIndex + 1 + nextTurnOffset;
 
-    const nextTurnOffset = server
-      .slice(serverAnchorIndex + 1)
-      .findIndex((candidate) => candidate.role === 'user');
-    const nextTurnIndex =
-      nextTurnOffset < 0 ? server.length : serverAnchorIndex + 1 + nextTurnOffset;
-    const persistedNoticeIndex = server.findIndex(
-      (candidate, index) =>
-        index > serverAnchorIndex &&
-        index < nextTurnIndex &&
-        candidate.role === message.role &&
-        candidate.content === message.content &&
-        !matchedServerNotices.has(index),
-    );
-    if (persistedNoticeIndex >= 0) {
-      matchedServerNotices.add(persistedNoticeIndex);
-      continue;
+    // The notice is the durable marker for one failed terminal sequence. Keep
+    // any marked partial immediately before it, but never resurrect unrelated
+    // local-only bubbles. Walk backwards so a missing partial is inserted
+    // before an already-persisted notice and the original order is preserved.
+    const terminalStart = localAnchorIndex + 1;
+    const retained = local
+      .slice(terminalStart, localIndex + 1)
+      .filter(isRetainedTerminalMessage);
+    let beforeIndex = nextTurnIndex;
+    const serverRangeStart = serverAnchorIndex < 0 ? 0 : serverAnchorIndex + 1;
+    for (let retainedIndex = retained.length - 1; retainedIndex >= 0; retainedIndex -= 1) {
+      const retainedMessage = retained[retainedIndex];
+      if (!retainedMessage) continue;
+      let persistedIndex = -1;
+      for (let index = beforeIndex - 1; index >= serverRangeStart; index -= 1) {
+        const candidate = server[index];
+        if (
+          candidate
+          && candidate.role === retainedMessage.role
+          && candidate.content === retainedMessage.content
+          && !matchedServerMessages.has(index)
+        ) {
+          persistedIndex = index;
+          break;
+        }
+      }
+      if (persistedIndex >= 0) {
+        matchedServerMessages.add(persistedIndex);
+        beforeIndex = persistedIndex;
+        continue;
+      }
+      insertions.set(beforeIndex, [retainedMessage, ...(insertions.get(beforeIndex) ?? [])]);
     }
-
-    insertions.set(nextTurnIndex, [...(insertions.get(nextTurnIndex) ?? []), message]);
   }
 
   if (insertions.size === 0) return server;

@@ -493,6 +493,7 @@ mod tests {
             error,
             committed_response: String::new(),
             new_messages: Vec::new(),
+            terminal_reason: None,
         };
 
         let outcome = match outcome_from_task_result(Err(err), String::new()) {

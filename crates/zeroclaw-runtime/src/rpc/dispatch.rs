@@ -2006,20 +2006,28 @@ impl RpcDispatcher {
             crate::rpc::types::ChatMode::Chat => {
                 if let Some(ref backend) = self.ctx.session_backend {
                     let key = format!("rpc_{sid}");
-                    let _ = backend.append(&key, &ChatMessage::user(&prompt));
                     match &outcome {
+                        Ok(TurnOutcome::ContextExhausted { messages, .. }) => {
+                            // The failed-turn delta is the canonical record:
+                            // enriched user input, any streamed partial, then
+                            // the runtime-authored notice. Persist it directly
+                            // so deriving only the last assistant text cannot
+                            // discard the partial or duplicate the user row.
+                            persist_chat_turn_messages(backend.as_ref(), &key, messages);
+                        }
                         Ok(TurnOutcome::Completed { text, .. }) => {
+                            let _ = backend.append(&key, &ChatMessage::user(&prompt));
                             let _ = backend.append(&key, &ChatMessage::assistant(text));
                         }
                         Ok(TurnOutcome::Cancelled { partial_text, .. })
                             if !partial_text.is_empty() =>
                         {
+                            let _ = backend.append(&key, &ChatMessage::user(&prompt));
                             let _ = backend.append(&key, &ChatMessage::assistant(partial_text));
                         }
-                        Ok(TurnOutcome::ContextExhausted { text, .. }) => {
-                            let _ = backend.append(&key, &ChatMessage::assistant(text));
+                        Ok(TurnOutcome::Cancelled { .. }) | Err(_) => {
+                            let _ = backend.append(&key, &ChatMessage::user(&prompt));
                         }
-                        _ => {}
                     }
                 }
             }
@@ -4829,6 +4837,25 @@ fn truncate_memory_previews(
 /// so the meter freezes at the default even when the profile is set higher.
 fn context_usage_max_tokens(cfg: &zeroclaw_config::schema::Config, agent_alias: &str) -> u64 {
     cfg.effective_max_context_tokens(agent_alias) as u64
+}
+
+/// Persist the Chat-compatible rows from the runtime's canonical turn delta.
+/// Structured tool messages have no representation in SessionBackend; system
+/// rows are prompt scaffolding and must never become transcript messages.
+fn persist_chat_turn_messages(
+    backend: &dyn zeroclaw_infra::session_backend::SessionBackend,
+    session_key: &str,
+    messages: &[zeroclaw_api::model_provider::ConversationMessage],
+) {
+    for message in messages {
+        let zeroclaw_api::model_provider::ConversationMessage::Chat(message) = message else {
+            continue;
+        };
+        if message.role == "system" {
+            continue;
+        }
+        let _ = backend.append(session_key, message);
+    }
 }
 
 /// Persist the exact turn delta captured before structured history trimming.
@@ -7919,6 +7946,121 @@ mod tests {
             serde_json::to_value(&restored.messages).unwrap(),
             serde_json::to_value(&messages).unwrap(),
             "session resume must retain the terminal explanation"
+        );
+    }
+
+    struct PartialThenContextProvider;
+
+    #[async_trait]
+    impl zeroclaw_api::model_provider::ModelProvider for PartialThenContextProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("streaming path required")
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: zeroclaw_api::model_provider::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: zeroclaw_api::model_provider::StreamOptions,
+        ) -> futures_util::stream::BoxStream<
+            'static,
+            zeroclaw_api::model_provider::StreamResult<zeroclaw_api::model_provider::StreamEvent>,
+        > {
+            use futures_util::StreamExt as _;
+            futures_util::stream::iter(vec![
+                Ok(zeroclaw_api::model_provider::StreamEvent::TextDelta(
+                    zeroclaw_api::model_provider::StreamChunk::delta("partial answer"),
+                )),
+                Err(zeroclaw_api::model_provider::StreamError::ModelProvider(
+                    "maximum context length exceeded".into(),
+                )),
+            ])
+            .boxed()
+        }
+    }
+
+    impl zeroclaw_api::attribution::Attributable for PartialThenContextProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "partial-context"
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_stream_context_error_persists_partial_and_notice_for_reload() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (dispatcher, sessions, chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, tmp.path());
+        let sid = "chat-context-partial";
+        let agent = crate::agent::agent::Agent::builder()
+            .model_provider(Box::new(PartialThenContextProvider))
+            .model_provider_name("test.partial-context".into())
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
+            .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+            .observer(Arc::new(crate::observability::noop::NoopObserver))
+            .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+            .workspace_dir(tmp.path().to_path_buf())
+            .build()
+            .expect("stream-error test agent should build");
+        sessions
+            .insert(
+                sid.to_string(),
+                crate::rpc::session::RpcSession::new(
+                    agent,
+                    "default",
+                    tmp.path().to_str().unwrap(),
+                    crate::rpc::types::ChatMode::Chat,
+                ),
+            )
+            .await
+            .unwrap();
+
+        let result = dispatcher
+            .handle_session_prompt(&json!({
+                "session_id": sid,
+                "prompt": "large request",
+            }))
+            .await
+            .expect("typed context exhaustion returns a terminal RPC result");
+        assert_eq!(result["stop_reason"], "context_exhausted");
+
+        let restored = chat_backend.load(&format!("rpc_{sid}"));
+        assert_eq!(
+            restored.len(),
+            3,
+            "reload must restore the complete failed turn"
+        );
+        assert!(
+            restored[0].content.ends_with("\n\nlarge request"),
+            "the canonical enriched user row must be persisted once"
+        );
+        assert_eq!(restored[1].role, "assistant");
+        assert_eq!(restored[1].content, "partial answer");
+        assert_eq!(restored[2].role, "assistant");
+        assert_eq!(
+            restored[2].content,
+            crate::i18n::get_required_cli_string("turn-context-exhausted")
         );
     }
 

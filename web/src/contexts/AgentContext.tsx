@@ -53,6 +53,9 @@ export interface ChatMessage {
   ephemeral?: boolean;
   /** User-visible lifecycle notice, rendered distinctly from agent output. */
   notice?: boolean;
+  /** Streamed output retained across reload only after a terminal frame says
+   *  the canonical failed-turn delta was not fully persisted. */
+  terminalPartial?: boolean;
 }
 
 interface AgentContextValue {
@@ -491,19 +494,39 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
         terminalExplanationRef.current = outcome.state;
         if (outcome.render.kind !== 'notice') break;
         const noticeContent = outcome.render.content;
+        const { completion: streamOutcome } = foldTurnStream({ type: 'context_exhausted' });
         if (outcome.clearBanner) setError(null);
         localMessageMutationVersionRef.current += 1;
-        setMessages((prev) => [
-          ...prev,
-          {
+        setMessages((prev) => {
+          const terminalMessages: ChatMessage[] = [];
+          if (streamOutcome?.kind === 'commit') {
+            terminalMessages.push({
+              id: generateUUID(),
+              role: 'agent',
+              content: streamOutcome.content,
+              thinking: streamOutcome.thinking,
+              markdown: true,
+              timestamp: new Date(),
+              // The gateway's persisted bit covers the entire canonical
+              // failed-turn delta. Retain this local copy only when that
+              // atomic promise is false; hydration knows this marker is safe.
+              ephemeral: msg.persisted !== false,
+              terminalPartial: msg.persisted === false || undefined,
+            });
+          }
+          terminalMessages.push({
             id: generateUUID(),
-            role: 'agent' as const,
+            role: 'agent',
             content: noticeContent,
             timestamp: new Date(),
             notice: true,
             ...contextExhaustedBubblePresentation(msg.persisted),
-          },
-        ]);
+          });
+          return [...prev, ...terminalMessages];
+        });
+        setStreamingContent('');
+        setStreamingThinking('');
+        setTyping(false);
         break;
       }
 

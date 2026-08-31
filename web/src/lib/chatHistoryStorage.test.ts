@@ -102,6 +102,60 @@ test('retained notice stays before a later persisted turn', () => {
   );
 });
 
+test('runtime-enriched server anchor keeps the notice before a later turn', () => {
+  const server = [
+    bubble(
+      'server-user-1',
+      'user',
+      '[CURRENT DATE & TIME: 2026-08-24 00:00:00 UTC]\n\nlarge request',
+    ),
+    bubble('server-user-2', 'user', 'later request'),
+    bubble('server-agent-2', 'agent', 'later response'),
+  ];
+  const local = [
+    { ...bubble('local-user-1', 'user', 'large request'), local: true },
+    bubble('local-notice', 'agent', NOTICE, true),
+  ];
+
+  const merged = mergeServerHistoryWithLocalNotices(server, local);
+
+  assert.deepEqual(
+    merged.map(({ content }) => content),
+    [
+      '[CURRENT DATE & TIME: 2026-08-24 00:00:00 UTC]\n\nlarge request',
+      NOTICE,
+      'later request',
+      'later response',
+    ],
+  );
+});
+
+test('anchorless retained notice deduplicates a copy already on the server', () => {
+  const server = [bubble('server-notice', 'agent', NOTICE)];
+  const local = [bubble('local-notice', 'agent', NOTICE, true)];
+
+  const merged = mergeServerHistoryWithLocalNotices(server, local);
+
+  assert.deepEqual(merged, server);
+  assert.equal(merged.filter((message) => message.content === NOTICE).length, 1);
+});
+
+test('failed persistence retains streamed partial and notice in canonical order', () => {
+  const server = [bubble('server-user', 'user', 'large request')];
+  const local = [
+    { ...bubble('local-user', 'user', 'large request'), local: true },
+    { ...bubble('local-partial', 'agent', 'partial answer'), terminalPartial: true },
+    bubble('local-notice', 'agent', NOTICE, true),
+  ];
+
+  const merged = mergeServerHistoryWithLocalNotices(server, local);
+
+  assert.deepEqual(
+    merged.map(({ content }) => content),
+    ['large request', 'partial answer', NOTICE],
+  );
+});
+
 test('identical assistant text in a later turn cannot consume the retained notice', () => {
   const server = [
     bubble('server-user-1', 'user', 'large request'),

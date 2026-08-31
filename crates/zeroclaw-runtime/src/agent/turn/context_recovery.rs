@@ -569,6 +569,9 @@ mod tests {
             partial_text: "partial reply".to_string(),
             message: "model_provider stream error: maximum context length exceeded".to_string(),
             usage: None,
+            cause: zeroclaw_providers::ReliableProviderTerminalFailure::from_error(
+                &anyhow::Error::msg("maximum context length exceeded"),
+            ),
         };
         let e = anyhow::Error::new(interrupted);
 
