@@ -198,12 +198,14 @@ pub(crate) fn read_capped_line<R: std::io::BufRead>(
     cap: usize,
 ) -> std::io::Result<CappedLine> {
     let mut raw = Vec::new();
-    // +1 headroom so the cap detection is unambiguous: a buffer that
-    // reaches exactly `cap` bytes without a `\n` was truncated; a
-    // buffer shorter than `cap` has the full line.
+    // +1 headroom distinguishes an over-cap payload from an exact-cap
+    // payload followed by its delimiter. The delimiter is not part of the
+    // payload limit.
     let mut limited = reader.take((cap + 1) as u64);
     std::io::BufRead::read_until(&mut limited, b'\n', &mut raw)?;
-    let truncated = raw.len() > cap;
+    let had_trailing_newline = raw.last() == Some(&b'\n');
+    let payload_len = raw.len() - usize::from(had_trailing_newline);
+    let truncated = payload_len > cap;
     if truncated {
         // Drain the rest of the physical line without accumulating it
         // in memory; `read_until` into a `Vec` would re-introduce the
@@ -212,7 +214,6 @@ pub(crate) fn read_capped_line<R: std::io::BufRead>(
         discard_until_newline(&mut inner)?;
         return Ok(CappedLine::Truncated);
     }
-    let had_trailing_newline = raw.last() == Some(&b'\n');
     if had_trailing_newline {
         // Strip the trailing `\n` that `read_until` leaves behind. The
         // lossy decode runs after the strip so the result has no
@@ -385,7 +386,9 @@ fn spawn_interactive_signal_task(
 
 struct InteractiveInputTask {
     request_tx: tokio::sync::mpsc::Sender<()>,
-    result_rx: tokio::sync::mpsc::Receiver<std::io::Result<CappedLine>>,
+    result_rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<std::io::Result<CappedLine>>>>,
+    #[cfg(windows)]
+    input_thread: std::thread::JoinHandle<()>,
 }
 
 fn interactive_input_result_is_terminal(result: &std::io::Result<CappedLine>) -> bool {
@@ -412,23 +415,118 @@ impl InteractiveInputTask {
                     }
                 }
             })?;
+
+        #[cfg(not(windows))]
         drop(input_thread);
 
         Ok(Self {
             request_tx,
-            result_rx,
+            result_rx: Arc::new(tokio::sync::Mutex::new(result_rx)),
+            #[cfg(windows)]
+            input_thread,
         })
     }
 
     fn request_line(&self) -> std::io::Result<()> {
-        self.request_tx.try_send(()).map_err(|error| {
-            let error = error.to_string();
-            std::io::Error::other(crate::i18n::get_required_cli_string_with_args(
-                "cli-agent-interactive-input-task-unavailable",
-                &[("error", error.as_str())],
-            ))
+        request_interactive_line(&self.request_tx)
+    }
+
+    async fn receive_result(&self) -> Option<std::io::Result<CappedLine>> {
+        self.result_rx.lock().await.recv().await
+    }
+
+    #[cfg(windows)]
+    fn approval_input(&self) -> crate::approval::CliApprovalInput {
+        use std::os::windows::io::AsRawHandle;
+
+        let request_tx = self.request_tx.clone();
+        let result_rx = Arc::clone(&self.result_rx);
+        let input_thread_handle = self.input_thread.as_raw_handle() as usize;
+        crate::approval::CliApprovalInput::new(move |cancellation_token| {
+            let request_tx = request_tx.clone();
+            let result_rx = Arc::clone(&result_rx);
+            async move {
+                if cancellation_token.is_cancelled() {
+                    return Ok(None);
+                }
+                request_interactive_line(&request_tx)?;
+                let mut result = Box::pin(async move {
+                    result_rx.lock().await.recv().await.ok_or_else(|| {
+                        std::io::Error::other(crate::i18n::get_required_cli_string(
+                            "cli-agent-interactive-input-task-stopped",
+                        ))
+                    })
+                });
+
+                let line = tokio::select! {
+                    biased;
+                    () = cancellation_token.cancelled() => {
+                        // `CancelSynchronousIo` can race just before the worker
+                        // enters `ReadFile`. Retry until either that read is
+                        // cancelled or it completed concurrently, then drain its
+                        // one result so the canonical worker is ready for the
+                        // next REPL prompt.
+                        loop {
+                            cancel_windows_synchronous_input(input_thread_handle);
+                            if let Ok(result) = tokio::time::timeout(
+                                std::time::Duration::from_millis(20),
+                                &mut result,
+                            )
+                            .await
+                            {
+                                let _ = result;
+                                return Ok(None);
+                            }
+                        }
+                    }
+                    result = &mut result => result?,
+                };
+
+                match line {
+                    CappedLine::Line(line) => Ok(Some(line)),
+                    CappedLine::Truncated | CappedLine::Eof => Ok(Some(String::new())),
+                }
+            }
         })
     }
+}
+
+async fn scope_interactive_approval_input<F: std::future::Future>(
+    input: &InteractiveInputTask,
+    future: F,
+) -> F::Output {
+    #[cfg(windows)]
+    {
+        return crate::approval::scope_cli_approval_input(input.approval_input(), future).await;
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = input;
+        future.await
+    }
+}
+
+fn request_interactive_line(request_tx: &tokio::sync::mpsc::Sender<()>) -> std::io::Result<()> {
+    request_tx.try_send(()).map_err(|error| {
+        let error = error.to_string();
+        std::io::Error::other(crate::i18n::get_required_cli_string_with_args(
+            "cli-agent-interactive-input-task-unavailable",
+            &[("error", error.as_str())],
+        ))
+    })
+}
+
+#[cfg(windows)]
+fn cancel_windows_synchronous_input(input_thread_handle: usize) {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::IO::CancelSynchronousIo;
+
+    // SAFETY: `input_thread_handle` comes from the live `JoinHandle` retained
+    // by `InteractiveInputTask`. Only its current synchronous stdin read is
+    // cancelled; the worker thread and the process-wide stdin handle remain
+    // owned by their existing canonical owners.
+    let _ = unsafe { CancelSynchronousIo(HANDLE(input_thread_handle as *mut std::ffi::c_void)) };
 }
 
 #[derive(Debug)]
@@ -438,7 +536,7 @@ enum InteractiveIdleEvent {
 }
 
 async fn wait_for_interactive_idle_event(
-    input: &mut InteractiveInputTask,
+    input: &InteractiveInputTask,
     signal_notices: &mut tokio::sync::mpsc::Receiver<InteractiveSignalNotice>,
 ) -> std::io::Result<InteractiveIdleEvent> {
     input.request_line()?;
@@ -451,7 +549,7 @@ async fn wait_for_interactive_idle_event(
                 "cli-agent-interactive-signal-task-stopped",
             ))),
         },
-        input_result = input.result_rx.recv() => match input_result {
+        input_result = input.receive_result() => match input_result {
             Some(result) => Ok(InteractiveIdleEvent::Input(result)),
             None => Err(std::io::Error::other(crate::i18n::get_required_cli_string(
                 "cli-agent-interactive-input-task-stopped",
@@ -2417,7 +2515,7 @@ pub async fn run(
             .context(crate::i18n::get_required_cli_string(
                 "cli-agent-interactive-signal-init-failed",
             ))?;
-            let mut input_task = InteractiveInputTask::spawn().context(
+            let input_task = InteractiveInputTask::spawn().context(
                 crate::i18n::get_required_cli_string("cli-agent-interactive-input-init-failed"),
             )?;
 
@@ -2438,32 +2536,31 @@ pub async fn run(
                 print!("> ");
                 let _ = std::io::stdout().flush();
 
-                let input =
-                    match wait_for_interactive_idle_event(&mut input_task, &mut signal_notices)
-                        .await
-                        .context(crate::i18n::get_required_cli_string(
-                            "cli-agent-interactive-input-lifecycle-failed",
-                        ))? {
-                        InteractiveIdleEvent::Interrupt => {
-                            println!();
-                            break 'interactive;
+                let input = match wait_for_interactive_idle_event(&input_task, &mut signal_notices)
+                    .await
+                    .context(crate::i18n::get_required_cli_string(
+                        "cli-agent-interactive-input-lifecycle-failed",
+                    ))? {
+                    InteractiveIdleEvent::Interrupt => {
+                        println!();
+                        break 'interactive;
+                    }
+                    InteractiveIdleEvent::Input(result) => match result {
+                        Ok(CappedLine::Eof) => break,
+                        Ok(CappedLine::Line(s)) => s,
+                        Ok(CappedLine::Truncated) => {
+                            eprintln!(
+                                "\nWarning: input line exceeds {} bytes and was discarded.",
+                                MAX_INTERACTIVE_INPUT_BYTES
+                            );
+                            continue;
                         }
-                        InteractiveIdleEvent::Input(result) => match result {
-                            Ok(CappedLine::Eof) => break,
-                            Ok(CappedLine::Line(s)) => s,
-                            Ok(CappedLine::Truncated) => {
-                                eprintln!(
-                                    "\nWarning: input line exceeds {} bytes and was discarded.",
-                                    MAX_INTERACTIVE_INPUT_BYTES
-                                );
-                                continue;
-                            }
-                            Err(e) => {
-                                eprintln!("\nError reading input: {e}\n");
-                                break;
-                            }
-                        },
-                    };
+                        Err(e) => {
+                            eprintln!("\nError reading input: {e}\n");
+                            break;
+                        }
+                    },
+                };
 
                 let user_input = input.trim().to_string();
                 if user_input.is_empty() {
@@ -2489,30 +2586,28 @@ pub async fn run(
                         print!("Continue? [y/N] ");
                         let _ = std::io::stdout().flush();
 
-                        let confirm = match wait_for_interactive_idle_event(
-                            &mut input_task,
-                            &mut signal_notices,
-                        )
-                        .await
-                        .context(crate::i18n::get_required_cli_string(
-                            "cli-agent-interactive-confirmation-input-lifecycle-failed",
-                        ))? {
-                            InteractiveIdleEvent::Interrupt => {
-                                println!();
-                                break 'interactive;
-                            }
-                            InteractiveIdleEvent::Input(result) => match result {
-                                Ok(CappedLine::Line(s)) => s,
-                                Ok(CappedLine::Eof) => {
-                                    println!("Cancelled.\n");
+                        let confirm =
+                            match wait_for_interactive_idle_event(&input_task, &mut signal_notices)
+                                .await
+                                .context(crate::i18n::get_required_cli_string(
+                                    "cli-agent-interactive-confirmation-input-lifecycle-failed",
+                                ))? {
+                                InteractiveIdleEvent::Interrupt => {
+                                    println!();
                                     break 'interactive;
                                 }
-                                Ok(CappedLine::Truncated) | Err(_) => {
-                                    println!("Cancelled.\n");
-                                    continue;
-                                }
-                            },
-                        };
+                                InteractiveIdleEvent::Input(result) => match result {
+                                    Ok(CappedLine::Line(s)) => s,
+                                    Ok(CappedLine::Eof) => {
+                                        println!("Cancelled.\n");
+                                        break 'interactive;
+                                    }
+                                    Ok(CappedLine::Truncated) | Err(_) => {
+                                        println!("Cancelled.\n");
+                                        continue;
+                                    }
+                                },
+                            };
                         if !matches!(confirm.trim().to_lowercase().as_str(), "y" | "yes") {
                             println!("Cancelled.\n");
                             continue;
@@ -2775,7 +2870,9 @@ pub async fn run(
                             thinking_params.native_thinking,
                             TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                                 cost_tracking_context.clone(),
-                                run_tool_call_loop(ToolLoop {
+                                scope_interactive_approval_input(
+                                    &input_task,
+                                    run_tool_call_loop(ToolLoop {
                                     exec: ResolvedAgentExecution::resolve(
                                         ResolvedModelAccess {
                                             model_provider: model_provider.as_ref(),
@@ -2845,7 +2942,8 @@ pub async fn run(
                                     sop_reassembly: Some(crate::agent::turn::SopStepReassembly {
                                         config: &config,
                                     }),
-                                }),
+                                    }),
+                                ),
                             ),
                         )
                         .await
@@ -17305,7 +17403,9 @@ Let me check the result."#;
         (
             InteractiveInputTask {
                 request_tx,
-                result_rx,
+                result_rx: Arc::new(tokio::sync::Mutex::new(result_rx)),
+                #[cfg(windows)]
+                input_thread: std::thread::spawn(|| {}),
             },
             request_rx,
             result_tx,
@@ -17314,14 +17414,14 @@ Let me check the result."#;
 
     #[tokio::test]
     async fn interactive_signal_lifecycle_idle_wait_returns_completed_input() {
-        let (mut input, mut request_rx, result_tx) = interactive_test_input_task();
+        let (input, mut request_rx, result_tx) = interactive_test_input_task();
         let (notice_tx, mut notice_rx) = tokio::sync::mpsc::channel(1);
         result_tx
             .send(Ok(CappedLine::Line("hello".to_string())))
             .await
             .unwrap();
 
-        let event = wait_for_interactive_idle_event(&mut input, &mut notice_rx)
+        let event = wait_for_interactive_idle_event(&input, &mut notice_rx)
             .await
             .unwrap();
 
@@ -17337,7 +17437,7 @@ Let me check the result."#;
 
     #[tokio::test]
     async fn interactive_signal_lifecycle_idle_wait_prioritizes_ctrl_c() {
-        let (mut input, mut request_rx, result_tx) = interactive_test_input_task();
+        let (input, mut request_rx, result_tx) = interactive_test_input_task();
         let (notice_tx, mut notice_rx) = tokio::sync::mpsc::channel(1);
         result_tx
             .send(Ok(CappedLine::Line("must not win".to_string())))
@@ -17345,7 +17445,7 @@ Let me check the result."#;
             .unwrap();
         notice_tx.send(InteractiveSignalNotice::Exit).await.unwrap();
 
-        let event = wait_for_interactive_idle_event(&mut input, &mut notice_rx)
+        let event = wait_for_interactive_idle_event(&input, &mut notice_rx)
             .await
             .unwrap();
 
@@ -17433,7 +17533,7 @@ Let me check the result."#;
         let phase = Arc::new(parking_lot::Mutex::new(InteractivePhase::Idle));
         let (mut notice_rx, signal_task) =
             spawn_interactive_signal_task(Arc::clone(&phase)).expect("install Ctrl+C listener");
-        let (mut input, mut request_rx, result_tx) = interactive_test_input_task();
+        let (input, mut request_rx, result_tx) = interactive_test_input_task();
         eprintln!("Windows Ctrl+C helper: listener installed");
 
         let signal_thread = std::thread::spawn(move || {
@@ -17445,7 +17545,7 @@ Let me check the result."#;
             eprintln!("Windows Ctrl+C helper: event generated");
         });
 
-        let event = wait_for_interactive_idle_event(&mut input, &mut notice_rx)
+        let event = wait_for_interactive_idle_event(&input, &mut notice_rx)
             .await
             .expect("idle wait should receive Ctrl+C");
         eprintln!("Windows Ctrl+C helper: event received");
@@ -17527,11 +17627,11 @@ Let me check the result."#;
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "subprocess helper for the Windows interactive stdin ownership regression"]
     async fn interactive_input_lifecycle_windows_releases_stdin_for_approval_child_helper() {
-        let mut input = InteractiveInputTask::spawn().expect("spawn interactive input task");
+        let input = InteractiveInputTask::spawn().expect("spawn interactive input task");
         input
             .request_line()
             .expect("request first interactive line");
-        match input.result_rx.recv().await {
+        match input.receive_result().await {
             Some(Ok(CappedLine::Line(line))) => assert_eq!(line, "first line"),
             other => panic!("expected first interactive line, got {other:?}"),
         }
@@ -17539,11 +17639,140 @@ Let me check the result."#;
         let manager = crate::approval::ApprovalManager::from_risk_profile(
             &zeroclaw_config::schema::RiskProfileConfig::default(),
         );
-        let response = manager.prompt_cli(&crate::approval::ApprovalRequest {
-            tool_name: "shell".to_string(),
-            arguments: serde_json::json!({"command": "echo approved"}),
+        let cancellation_token = CancellationToken::new();
+        let response = crate::approval::scope_cli_approval_input(
+            input.approval_input(),
+            manager.prompt_cli_cancellable(
+                &crate::approval::ApprovalRequest {
+                    tool_name: "shell".to_string(),
+                    arguments: serde_json::json!({"command": "echo approved"}),
+                },
+                Some(&cancellation_token),
+            ),
+        )
+        .await;
+        assert_eq!(
+            response,
+            crate::approval::CliApprovalPromptOutcome::Decision(
+                crate::approval::ApprovalResponse::Yes
+            )
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn interactive_input_lifecycle_windows_ctrl_c_cancels_blocked_approval() {
+        use std::io::Read;
+        use std::os::windows::process::CommandExt;
+        use std::process::Stdio;
+
+        const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+        let current_exe = std::env::current_exe().expect("current test binary path");
+        let mut child = std::process::Command::new(current_exe)
+            .args([
+                "interactive_input_lifecycle_windows_ctrl_c_cancels_blocked_approval_child_helper",
+                "--ignored",
+                "--nocapture",
+            ])
+            .creation_flags(CREATE_NEW_CONSOLE)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("Windows approval cancellation helper process should start");
+        let stdin_guard = child.stdin.take().expect("helper stdin pipe");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut timed_out = false;
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("query helper process status") {
+                break status;
+            }
+            if std::time::Instant::now() >= deadline {
+                timed_out = true;
+                child.kill().expect("terminate timed-out helper process");
+                break child.wait().expect("reap timed-out helper process");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        drop(stdin_guard);
+
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        child
+            .stdout
+            .take()
+            .expect("helper stdout pipe")
+            .read_to_string(&mut stdout)
+            .expect("read helper stdout");
+        child
+            .stderr
+            .take()
+            .expect("helper stderr pipe")
+            .read_to_string(&mut stderr)
+            .expect("read helper stderr");
+
+        assert!(
+            !timed_out,
+            "Windows Ctrl+C left approval blocked\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "Windows approval cancellation helper failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "subprocess helper for the Windows approval cancellation regression"]
+    async fn interactive_input_lifecycle_windows_ctrl_c_cancels_blocked_approval_child_helper() {
+        use windows::Win32::System::Console::{
+            CTRL_C_EVENT, GenerateConsoleCtrlEvent, SetConsoleCtrlHandler,
+        };
+
+        unsafe { SetConsoleCtrlHandler(None, false) }
+            .expect("enable Ctrl+C handling in helper process");
+        let phase = Arc::new(parking_lot::Mutex::new(InteractivePhase::Idle));
+        let cancellation_token = phase
+            .lock()
+            .begin_turn()
+            .expect("helper turn starts from idle");
+        let (_notice_rx, signal_task) =
+            spawn_interactive_signal_task(Arc::clone(&phase)).expect("install Ctrl+C listener");
+        let input = InteractiveInputTask::spawn().expect("spawn interactive input task");
+        let manager = crate::approval::ApprovalManager::from_risk_profile(
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+
+        let signal_thread = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            // SAFETY: this helper is the only process in its isolated test console.
+            unsafe { GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0) }
+                .expect("generate CTRL_C_EVENT during approval");
         });
-        assert_eq!(response, crate::approval::ApprovalResponse::Yes);
+
+        let response = crate::approval::scope_cli_approval_input(
+            input.approval_input(),
+            manager.prompt_cli_cancellable(
+                &crate::approval::ApprovalRequest {
+                    tool_name: "shell".to_string(),
+                    arguments: serde_json::json!({"command": "echo must-not-run"}),
+                },
+                Some(&cancellation_token),
+            ),
+        )
+        .await;
+
+        assert_eq!(
+            response,
+            crate::approval::CliApprovalPromptOutcome::Cancelled
+        );
+        assert!(cancellation_token.is_cancelled());
+        assert!(phase.lock().finish_turn());
+        assert!(matches!(*phase.lock(), InteractivePhase::Idle));
+        signal_thread.join().expect("Ctrl+C generator thread");
+        signal_task.shutdown().await;
     }
 
     /// When the caller pre-mints a turn id (`process_message` does, so its
@@ -18271,6 +18500,23 @@ Pin 13: LED
                 assert_eq!(line.len(), cap);
             }
             other => panic!("expected Line, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_capped_line_at_exact_cap_with_newline_preserves_next_line() {
+        let cap = 8usize;
+        let mut input = vec![b'x'; cap];
+        input.extend_from_slice(b"\nnext\n");
+        let mut cursor = std::io::Cursor::new(input);
+
+        match read_capped_line(&mut cursor, cap).unwrap() {
+            CappedLine::Line(line) => assert_eq!(line.as_bytes(), vec![b'x'; cap]),
+            other => panic!("expected exact-cap Line, got {other:?}"),
+        }
+        match read_capped_line(&mut cursor, cap).unwrap() {
+            CappedLine::Line(line) => assert_eq!(line, "next"),
+            other => panic!("expected subsequent Line, got {other:?}"),
         }
     }
 
