@@ -553,17 +553,25 @@ mod tests {
             ),
             ("cli-quickstart-empty-checklist", vec![]),
         ];
-        for (source, locale) in channel_approval_locale_sources() {
+        for locale in available_locales() {
+            let source = if locale.code == "en" {
+                include_str!("../locales/en/cli.ftl")
+            } else {
+                builtin_cli_ftl_source(&locale.code)
+                    .unwrap_or_else(|| panic!("{} must have a built-in CLI catalogue", locale.code))
+            };
             for (key, args) in &cases {
-                let message = format_ftl_message(source, locale, key, args)
-                    .unwrap_or_else(|| panic!("{locale}: {key} should be defined"));
+                let message = format_ftl_message(source, &locale.code, key, args)
+                    .unwrap_or_else(|| panic!("{}: {key} should be defined", locale.code));
                 assert!(
                     !message.trim().is_empty(),
-                    "{locale}: {key} should not be empty"
+                    "{}: {key} should not be empty",
+                    locale.code
                 );
                 assert!(
                     !message.contains('{'),
-                    "{locale}: {key} should interpolate every argument; got {message:?}"
+                    "{}: {key} should interpolate every argument; got {message:?}",
+                    locale.code
                 );
             }
         }
