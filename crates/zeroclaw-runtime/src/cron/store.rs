@@ -25,8 +25,10 @@ pub(crate) enum RunCompletionAction {
 
 /// Opaque ownership proof for one cron execution claim.
 ///
-/// `locked_at`/`locked_until` describe lease timing, while this token is the
-/// canonical identity that fences every release and scheduled-result write.
+/// `locked_at` records that a run is active, while this token is the canonical
+/// identity that fences every release and scheduled-result write. Claims do
+/// not expire inside a live process: only the owner may release them, and
+/// startup recovery clears claims left by a dead process.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CronClaimToken(String);
 
@@ -833,20 +835,19 @@ pub fn skip_missed_run(config: &Config, job: &CronJob, now: DateTime<Utc>) -> Re
     }
 }
 
-pub(crate) fn claim_job_with_lease(
+pub(crate) fn claim_job_with_token(
     config: &Config,
     job_id: &str,
     now: DateTime<Utc>,
-    locked_until: DateTime<Utc>,
 ) -> Result<Option<CronClaimToken>> {
     let token = Uuid::new_v4().to_string();
     with_initialized_connection(config, |conn| {
         let claimed = conn
             .execute(
                 "UPDATE cron_jobs
-                 SET locked_at = ?1, locked_until = ?2, claim_token = ?3
-                 WHERE id = ?4 AND locked_at IS NULL",
-                params![now.to_rfc3339(), locked_until.to_rfc3339(), token, job_id],
+                 SET locked_at = ?1, claim_token = ?2
+                 WHERE id = ?3 AND locked_at IS NULL",
+                params![now.to_rfc3339(), token, job_id],
             )
             .context("Failed to claim cron job for execution")?;
         Ok((claimed == 1).then_some(CronClaimToken(token)))
@@ -858,7 +859,7 @@ pub(crate) fn release_claim(config: &Config, job_id: &str, claim: &CronClaimToke
         let released = conn
             .execute(
                 "UPDATE cron_jobs
-             SET locked_at = NULL, locked_until = NULL, claim_token = NULL
+             SET locked_at = NULL, claim_token = NULL
              WHERE id = ?1 AND claim_token = ?2",
                 params![job_id, claim.0.as_str()],
             )
@@ -867,23 +868,9 @@ pub(crate) fn release_claim(config: &Config, job_id: &str, claim: &CronClaimToke
     })
 }
 
-pub(crate) fn clear_expired_claims(config: &Config, now: DateTime<Utc>) -> Result<usize> {
-    let cleared = with_read_connection(config, |conn| {
-        conn.execute(
-            "UPDATE cron_jobs
-             SET locked_at = NULL, locked_until = NULL, claim_token = NULL
-             WHERE locked_at IS NOT NULL AND locked_until IS NOT NULL AND locked_until <= ?1",
-            params![now.to_rfc3339()],
-        )
-        .context("Failed to recover expired cron job claims")
-    })?;
-    Ok(cleared.unwrap_or(0))
-}
-
 #[cfg(test)]
 pub fn claim_job(config: &Config, job_id: &str, now: DateTime<Utc>) -> Result<bool> {
-    claim_job_with_lease(config, job_id, now, now + chrono::Duration::hours(24))
-        .map(|claim| claim.is_some())
+    claim_job_with_token(config, job_id, now).map(|claim| claim.is_some())
 }
 
 #[cfg(test)]
@@ -891,7 +878,7 @@ pub fn release_job(config: &Config, job_id: &str) -> Result<()> {
     with_initialized_connection(config, |conn| {
         conn.execute(
             "UPDATE cron_jobs
-             SET locked_at = NULL, locked_until = NULL, claim_token = NULL
+             SET locked_at = NULL, claim_token = NULL
              WHERE id = ?1",
             params![job_id],
         )
@@ -918,7 +905,7 @@ pub fn clear_stale_locks(config: &Config) -> Result<usize> {
     let cleared = with_read_connection(config, |conn| {
         conn.execute(
             "UPDATE cron_jobs
-             SET locked_at = NULL, locked_until = NULL, claim_token = NULL
+             SET locked_at = NULL, claim_token = NULL
              WHERE locked_at IS NOT NULL",
             [],
         )
@@ -1098,7 +1085,7 @@ fn release_claim_in_transaction(
     }
     let released = conn.execute(
         "UPDATE cron_jobs
-         SET locked_at = NULL, locked_until = NULL, claim_token = NULL
+         SET locked_at = NULL, claim_token = NULL
          WHERE id = ?1 AND claim_token = ?2",
         params![job_id, claim.0.as_str()],
     )?;
@@ -1922,7 +1909,6 @@ fn initialize_schema(conn: &Connection) -> Result<()> {
     // runs longer than the poll interval cannot be launched again while still in
     // flight (see `claim_job`/`release_job` and
     add_column_if_missing(conn, "locked_at", "TEXT")?;
-    add_column_if_missing(conn, "locked_until", "TEXT")?;
     add_column_if_missing(conn, "claim_token", "TEXT")?;
     add_column_if_missing(
         conn,
@@ -2310,32 +2296,26 @@ mod tests {
     }
 
     #[test]
-    fn expired_claim_recovery_fences_late_persistence() {
+    fn active_claim_cannot_expire_or_be_replaced_in_process() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
         let job = add_job(&config, "test-agent", "*/5 * * * *", "echo ok").unwrap();
         let started = Utc::now();
-        let old_claim = claim_job_with_lease(
-            &config,
-            &job.id,
-            started,
-            started + ChronoDuration::seconds(1),
-        )
-        .unwrap()
-        .expect("first worker claims the job");
+        let old_claim = claim_job_with_token(&config, &job.id, started)
+            .unwrap()
+            .expect("first worker claims the job");
 
-        assert_eq!(
-            clear_expired_claims(&config, started + ChronoDuration::seconds(2)).unwrap(),
-            1
+        assert!(
+            claim_job_with_token(&config, &job.id, started + ChronoDuration::days(365))
+                .unwrap()
+                .is_none(),
+            "wall-clock age must not erase ownership while the process is live"
         );
-        let replacement_claim = claim_job_with_lease(
-            &config,
-            &job.id,
-            started + ChronoDuration::seconds(2),
-            started + ChronoDuration::hours(1),
-        )
-        .unwrap()
-        .expect("replacement worker reclaims the expired job");
+        assert!(release_claim(&config, &job.id, &old_claim).unwrap());
+        let replacement_claim =
+            claim_job_with_token(&config, &job.id, started + ChronoDuration::seconds(2))
+                .unwrap()
+                .expect("replacement worker claims only after the owner releases");
         assert_ne!(old_claim.as_str(), replacement_claim.as_str());
 
         let finished = started + ChronoDuration::seconds(3);
@@ -2351,7 +2331,7 @@ mod tests {
             RunCompletionAction::Reschedule,
             &old_claim,
         )
-        .expect_err("the expired worker must not write through the replacement claim");
+        .expect_err("the released owner must not write through the replacement claim");
         assert!(stale_error.to_string().contains("stale"));
         assert!(list_runs(&config, &job.id, 10).unwrap().is_empty());
 

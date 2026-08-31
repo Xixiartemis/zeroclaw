@@ -4,12 +4,12 @@ use crate::cron::store::{
 };
 use crate::cron::{
     CronJob, DeliveryConfig, JobType, Schedule, SessionTarget, all_overdue_jobs,
-    claim_job_with_lease, clear_expired_claims, clear_stale_locks, due_jobs, next_run_for_schedule,
-    release_claim, skip_missed_run, sync_declarative_jobs,
+    claim_job_with_token, clear_stale_locks, due_jobs, next_run_for_schedule, release_claim,
+    skip_missed_run, sync_declarative_jobs,
 };
 use crate::security::SecurityPolicy;
 use anyhow::Result;
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use chrono::{DateTime, Utc};
 use futures_util::{StreamExt, stream};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -33,6 +33,10 @@ const AGENT_JOB_TIMEOUT_PREFIX: &str = "agent job timed out after ";
 // critical path. Cleanup is still attempted; exceeding this deadline
 // abandons it (logged) rather than blocking the unbounded lock-release path.
 const ISOLATED_SESSION_PURGE_TIMEOUT: Duration = Duration::from_secs(3);
+// Cleanup is best-effort and may be abandoned while synchronously blocked.
+// Admit only one such worker process-wide so a permanently wedged backend
+// consumes a bounded resource instead of one OS thread per recurring run.
+const MAX_BEST_EFFORT_PURGE_WORKERS: usize = 1;
 // Announcement delivery is awaited by `persist_job_result` *before*
 // `execute_and_persist_job` calls `release_job`, so a channel send that never
 // completes (dead socket, wedged provider, unresponsive HTTP endpoint) would
@@ -43,10 +47,10 @@ const ISOLATED_SESSION_PURGE_TIMEOUT: Duration = Duration::from_secs(3);
 // terminal classification waits until the supervised delivery has stopped.
 const CRON_DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);
 // SQLite persistence is synchronous. Drive it on a blocking worker and bound
-// how long the scheduler awaits that worker; claim-token fencing makes a late
-// worker harmless after its lease is reclaimed.
+// how long the scheduler awaits that worker. A timed-out worker keeps its
+// claim, and claim-token fencing prevents a stale write if ownership is later
+// reset during process-startup recovery.
 const CRON_PERSIST_TIMEOUT: Duration = Duration::from_secs(5);
-const CRON_CLAIM_GRACE_SECS: u64 = 60;
 const SCHEDULER_COMPONENT: &str = "scheduler";
 const CRON_AGENT_DEFAULT_EXCLUDED_TOOLS: &[&str] = &[
     "cron_add",
@@ -97,6 +101,11 @@ tokio::task_local! {
 }
 
 #[cfg(test)]
+tokio::task_local! {
+    static TEST_BEST_EFFORT_WORKER_POOL: Arc<tokio::sync::Semaphore>;
+}
+
+#[cfg(test)]
 struct TestActiveWorkerGuard(Arc<std::sync::atomic::AtomicUsize>);
 
 #[cfg(test)]
@@ -114,17 +123,50 @@ impl Drop for TestActiveWorkerGuard {
     }
 }
 
-/// The outcome of [`abandon_best_effort`] when the deadline expires first.
-///
-/// Deliberately NOT named `Cancelled`: reaching this variant means the
-/// supervised work was **abandoned**, not preempted. See
-/// [`abandon_best_effort`] for the full contract.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Abandoned;
+/// Failure modes for best-effort supervision. A deadline means the operation
+/// was abandoned, not preempted; at-capacity means an earlier abandoned purge
+/// may still own the single bounded worker slot.
+#[derive(Debug)]
+enum BestEffortSupervisionError {
+    AtCapacity,
+    DeadlineExceeded,
+    ThreadSpawn(std::io::Error),
+    RuntimeBuild(std::io::Error),
+    WorkerStopped,
+}
 
-impl std::fmt::Display for Abandoned {
+impl std::fmt::Display for BestEffortSupervisionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("supervised operation exceeded its wall-clock deadline and was abandoned")
+        match self {
+            Self::AtCapacity => f.write_str("best-effort cleanup worker capacity is exhausted"),
+            Self::DeadlineExceeded => {
+                f.write_str("supervised operation exceeded its deadline and was abandoned")
+            }
+            Self::ThreadSpawn(error) => write!(f, "failed to start cleanup worker: {error}"),
+            Self::RuntimeBuild(error) => write!(f, "failed to build cleanup runtime: {error}"),
+            Self::WorkerStopped => f.write_str("cleanup worker stopped unexpectedly"),
+        }
+    }
+}
+
+fn best_effort_worker_pool() -> Arc<tokio::sync::Semaphore> {
+    #[cfg(test)]
+    {
+        TEST_BEST_EFFORT_WORKER_POOL
+            .try_with(Arc::clone)
+            .unwrap_or_else(|_| {
+                Arc::new(tokio::sync::Semaphore::new(MAX_BEST_EFFORT_PURGE_WORKERS))
+            })
+    }
+
+    #[cfg(not(test))]
+    {
+        static POOL: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+        Arc::clone(
+            POOL.get_or_init(|| {
+                Arc::new(tokio::sync::Semaphore::new(MAX_BEST_EFFORT_PURGE_WORKERS))
+            }),
+        )
     }
 }
 
@@ -164,12 +206,13 @@ impl std::fmt::Display for Abandoned {
 ///
 /// # Cancellation semantics — abandonment, not preemption
 ///
-/// On `Err(Abandoned)` the underlying operation **may still be running**. There
-/// is no way to preempt a thread that is blocked inside synchronous code, and
-/// this function deliberately does not pretend otherwise. It guarantees only
-/// that *the caller* is released at the deadline so it can persist state and
-/// drop its lock. Callers must therefore treat supervised work as abandoned:
-/// safe to walk away from, not known to have stopped. The only production
+/// On `DeadlineExceeded` the underlying operation **may still be running**.
+/// There is no way to preempt a thread that is blocked inside synchronous
+/// code, and this function deliberately does not pretend otherwise. It
+/// guarantees only that *the caller* is released at the deadline so it can
+/// persist state and drop its lock. The process-wide admission slot remains
+/// owned until that worker really exits; if it never does, later cleanup is
+/// skipped at capacity rather than leaking more threads. The only production
 /// caller is isolated-session cleanup, which is best-effort and scoped to a
 /// run-unique key. Agent execution and delivery use [`supervise_owned`]
 /// because their user-visible side effects cannot be detached from the
@@ -183,10 +226,13 @@ impl std::fmt::Display for Abandoned {
 async fn abandon_best_effort<T>(
     deadline: Duration,
     f: std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send>>,
-) -> Result<T, Abandoned>
+) -> Result<T, BestEffortSupervisionError>
 where
     T: Send + 'static,
 {
+    let permit = best_effort_worker_pool()
+        .try_acquire_owned()
+        .map_err(|_| BestEffortSupervisionError::AtCapacity)?;
     let (tx, rx) = tokio::sync::oneshot::channel();
     // A dedicated OS thread with its own current-thread runtime. Deliberately
     // NOT `spawn_blocking` + `Handle::block_on`: that borrows the caller's
@@ -203,35 +249,30 @@ where
                 .build()
             {
                 Ok(rt) => rt,
-                // Dropping `tx` without sending makes the caller observe
-                // `Abandoned`, which is the correct outcome: the work never ran.
-                Err(_) => return,
+                Err(error) => {
+                    let _ = tx.send(Err(BestEffortSupervisionError::RuntimeBuild(error)));
+                    return;
+                }
             };
-            // Result ignored: an `Err` here just means the caller already hit the
-            // deadline and dropped the receiver. Nothing left to report to.
-            let _ = tx.send(rt.block_on(f));
-            // The runtime is dropped here, on this thread. If `f` left work
-            // behind, cleanup costs this thread and not the caller's.
+            let value = rt.block_on(f);
+            drop(rt);
+            drop(permit);
+            // An error here means the caller already hit the deadline and
+            // dropped the receiver. Nothing remains to report to.
+            let _ = tx.send(Ok(value));
         });
 
-    // Thread spawn can fail under fd/thread exhaustion. Report it as
-    // abandonment rather than panicking inside the scheduler.
-    let worker = match worker {
-        Ok(worker) => worker,
-        Err(_) => return Err(Abandoned),
-    };
+    let worker = worker.map_err(BestEffortSupervisionError::ThreadSpawn)?;
 
     match time::timeout(deadline, rx).await {
-        Ok(Ok(value)) => Ok(value),
-        // The worker thread died (panicked) without sending. Not a deadline
-        // breach; surfaced as abandonment so callers keep one error path.
-        Ok(Err(_)) => Err(Abandoned),
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err(BestEffortSupervisionError::WorkerStopped),
         Err(_) => {
             // Do NOT join `worker`: it may be blocked indefinitely, which is
             // the whole reason this function exists. Detaching is what makes
             // the deadline real, and is why the contract is "abandoned".
             drop(worker);
-            Err(Abandoned)
+            Err(BestEffortSupervisionError::DeadlineExceeded)
         }
     }
 }
@@ -364,6 +405,11 @@ fn delivery_timeout() -> Duration {
 /// Type alias for the optional broadcast sender used to push cron results
 /// to connected dashboard/SSE clients.
 pub type EventBroadcast = Option<tokio::sync::broadcast::Sender<serde_json::Value>>;
+
+struct ClaimedJobResult {
+    success: bool,
+    output: String,
+}
 
 #[must_use]
 pub fn is_no_reply_sentinel(output: &str) -> bool {
@@ -736,23 +782,6 @@ pub async fn run(
                 // Keep scheduler liveness fresh even when there are no due jobs.
                 crate::health::mark_component_ok(SCHEDULER_COMPONENT);
 
-                match clear_expired_claims(&config, Utc::now()) {
-                    Ok(0) => {}
-                    Ok(cleared) => ::zeroclaw_log::record!(
-                        INFO,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_attrs(::serde_json::json!({"cleared": cleared})),
-                        "Recovered expired cron execution claims"
-                    ),
-                    Err(e) => ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"error": e.to_string()})),
-                        "Failed to recover expired cron execution claims"
-                    ),
-                }
-
                 let jobs = match due_jobs(&config, Utc::now()) {
                     Ok(jobs) => jobs,
                     Err(e) => {
@@ -1046,41 +1075,11 @@ struct ClaimedJob {
     claim: CronClaimToken,
 }
 
-fn cron_claim_deadline(config: &Config, job: &CronJob, now: DateTime<Utc>) -> DateTime<Utc> {
-    let owning_agent = resolve_owning_agent(config, job).unwrap_or_default();
-    let attempt_secs = match job.job_type {
-        JobType::Shell => SHELL_JOB_TIMEOUT_SECS,
-        JobType::Agent => resolve_agent_job_timeout(config, owning_agent).as_secs(),
-    };
-    let attempts = u64::from(config.reliability.scheduler_retries).saturating_add(1);
-
-    let mut retry_delay_ms = config.reliability.provider_backoff_ms.max(200);
-    let mut total_backoff_ms = 0_u64;
-    for _ in 0..config.reliability.scheduler_retries {
-        total_backoff_ms = total_backoff_ms
-            .saturating_add(retry_delay_ms)
-            .saturating_add(250);
-        retry_delay_ms = retry_delay_ms.saturating_mul(2).min(30_000);
-    }
-
-    let lease_secs = attempt_secs
-        .saturating_mul(attempts)
-        .saturating_add(total_backoff_ms.saturating_add(999) / 1_000)
-        .saturating_add(CRON_DELIVERY_TIMEOUT.as_secs())
-        .saturating_add(CRON_PERSIST_TIMEOUT.as_secs())
-        .saturating_add(CRON_CLAIM_GRACE_SECS)
-        .max(CRON_CLAIM_GRACE_SECS);
-    let lease_secs = i64::try_from(lease_secs).unwrap_or(i64::MAX);
-    now.checked_add_signed(ChronoDuration::seconds(lease_secs))
-        .unwrap_or(DateTime::<Utc>::MAX_UTC)
-}
-
 fn claim_due_jobs(config: &Config, jobs: Vec<CronJob>) -> Vec<ClaimedJob> {
     jobs.into_iter()
         .filter_map(|job| {
             let now = Utc::now();
-            match claim_job_with_lease(config, &job.id, now, cron_claim_deadline(config, &job, now))
-            {
+            match claim_job_with_token(config, &job.id, now) {
                 Ok(Some(claim)) => Some(ClaimedJob { job, claim }),
                 Ok(None) => {
                     ::zeroclaw_log::record!(
@@ -1215,7 +1214,7 @@ async fn execute_and_persist_claimed_job(
     .instrument(span)
     .await;
     let finished_at = Utc::now();
-    let success = Box::pin(persist_claimed_job_result(
+    let result = Box::pin(persist_claimed_job_result(
         config,
         job,
         success,
@@ -1226,7 +1225,7 @@ async fn execute_and_persist_claimed_job(
     ))
     .await;
 
-    (job.id.clone(), success, output)
+    (job.id.clone(), result.success, result.output)
 }
 
 #[cfg(test)]
@@ -1301,7 +1300,9 @@ tokio::task_local! {
 /// first await, so leaving the call inline under a same-runtime timer would
 /// let a contended `audit.db` starve the cleanup deadline and re-pin
 /// `locked_at`. On timeout the cleanup is abandoned (logged at WARN) rather
-/// than awaited further; the successful, fast-cleanup path is unaffected.
+/// than awaited further. Its admission slot remains occupied until the worker
+/// actually stops, so a permanently blocked backend cannot accumulate more
+/// detached threads; later cleanup attempts are skipped at capacity.
 async fn purge_isolated_session(
     config: &Config,
     job: &CronJob,
@@ -1365,10 +1366,7 @@ async fn purge_isolated_session(
         let _ = mem.purge_session(&mem_session_key).await;
     };
 
-    if abandon_best_effort(ISOLATED_SESSION_PURGE_TIMEOUT, Box::pin(purge))
-        .await
-        .is_err()
-    {
+    if let Err(error) = abandon_best_effort(ISOLATED_SESSION_PURGE_TIMEOUT, Box::pin(purge)).await {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -1377,8 +1375,9 @@ async fn purge_isolated_session(
                     "job_id": job.id,
                     "agent": agent_alias,
                     "timeout_secs": ISOLATED_SESSION_PURGE_TIMEOUT.as_secs(),
+                    "reason": error.to_string(),
                 })),
-            "Cron job: isolated-session purge exceeded its cleanup deadline; abandoning \
+            "Cron job: isolated-session purge did not complete; skipping or abandoning \
              best-effort cleanup so lock release is not delayed"
         );
     }
@@ -1608,7 +1607,7 @@ async fn persist_claimed_job_result(
     started_at: DateTime<Utc>,
     finished_at: DateTime<Utc>,
     claim: &CronClaimToken,
-) -> bool {
+) -> ClaimedJobResult {
     let duration_ms = (finished_at - started_at).num_milliseconds();
     let outcome = deliver_and_classify_run_result(
         config,
@@ -1633,6 +1632,7 @@ async fn persist_claimed_job_result(
     let owned_claim = claim.clone();
     let status = outcome.status;
     let persisted_output = outcome.output;
+    let public_output = persisted_output.clone();
     let job_state_at = Utc::now();
     #[cfg(test)]
     let persist_block = TEST_PERSIST_BLOCK.try_with(|duration| *duration).ok();
@@ -1707,7 +1707,9 @@ async fn persist_claimed_job_result(
                     );
                 }
             }
+            return false;
         }
+        true
     });
 
     #[cfg(test)]
@@ -1718,24 +1720,43 @@ async fn persist_claimed_job_result(
     let persist_timeout = CRON_PERSIST_TIMEOUT;
 
     match time::timeout(persist_timeout, worker).await {
-        Ok(Ok(())) => {}
-        Ok(Err(join_error)) => ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({"job_id": job.id, "error": join_error.to_string()})),
-            "Cron persistence worker stopped before completion"
-        ),
-        Err(_) => ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({"job_id": job.id, "timeout_secs": persist_timeout.as_secs_f64()})),
-            "Cron persistence exceeded its deadline; retaining the fenced claim for recovery"
-        ),
+        Ok(Ok(true)) => ClaimedJobResult {
+            success: reported_success,
+            output: public_output,
+        },
+        Ok(Ok(false)) => ClaimedJobResult {
+            success: false,
+            output: crate::i18n::get_required_cli_string("cron-result-persistence-failed"),
+        },
+        Ok(Err(join_error)) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(
+                        ::serde_json::json!({"job_id": job.id, "error": join_error.to_string()})
+                    ),
+                "Cron persistence worker stopped before completion"
+            );
+            ClaimedJobResult {
+                success: false,
+                output: crate::i18n::get_required_cli_string("cron-result-persistence-failed"),
+            }
+        }
+        Err(_) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"job_id": job.id, "timeout_secs": persist_timeout.as_secs_f64()})),
+                "Cron persistence exceeded its deadline; retaining the fenced claim for recovery"
+            );
+            ClaimedJobResult {
+                success: false,
+                output: crate::i18n::get_required_cli_string("cron-result-persistence-pending"),
+            }
+        }
     }
-
-    reported_success
 }
 
 #[cfg(test)]
@@ -1749,7 +1770,7 @@ async fn persist_job_result(
 ) -> bool {
     let now = Utc::now();
     let claim = crate::cron::store::current_claim_for_test(config, &job.id).or_else(|_| {
-        claim_job_with_lease(config, &job.id, now, now + ChronoDuration::hours(24))?
+        claim_job_with_token(config, &job.id, now)?
             .ok_or_else(|| anyhow::Error::msg(format!("test job '{}' is already claimed", job.id)))
     });
     let claim = claim.expect("test persistence requires a claimable stored job");
@@ -1763,6 +1784,7 @@ async fn persist_job_result(
         &claim,
     )
     .await
+    .success
 }
 
 fn is_one_shot_auto_delete(job: &CronJob) -> bool {
@@ -3896,6 +3918,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn abandon_best_effort_bounds_permanently_stalled_worker_admission() {
+        let pool = Arc::new(tokio::sync::Semaphore::new(MAX_BEST_EFFORT_PURGE_WORKERS));
+        TEST_BEST_EFFORT_WORKER_POOL
+            .scope(Arc::clone(&pool), async {
+                let first = abandon_best_effort(
+                    Duration::from_millis(25),
+                    Box::pin(async {
+                        std::thread::sleep(Duration::from_millis(250));
+                    }),
+                )
+                .await;
+                assert!(matches!(
+                    first,
+                    Err(BestEffortSupervisionError::DeadlineExceeded)
+                ));
+
+                let second = abandon_best_effort(
+                    Duration::from_millis(25),
+                    Box::pin(async { "must not start" }),
+                )
+                .await;
+                assert!(matches!(
+                    second,
+                    Err(BestEffortSupervisionError::AtCapacity)
+                ));
+                assert_eq!(
+                    pool.available_permits(),
+                    0,
+                    "the abandoned worker must retain its slot until its thread exits"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test]
     async fn supervise_owned_rejects_completion_after_deadline() {
         let outcome = supervise_owned(
             Duration::from_millis(50),
@@ -4650,22 +4707,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blocked_persistence_is_bounded_and_cannot_overwrite_reclaimed_run() {
+    async fn blocked_persistence_reports_pending_and_retains_live_claim() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
         let job = cron::add_job(&config, TEST_AGENT, "*/5 * * * *", "echo ok").unwrap();
         let started = Utc::now();
-        let old_claim = claim_job_with_lease(
-            &config,
-            &job.id,
-            started,
-            started + ChronoDuration::seconds(1),
-        )
-        .unwrap()
-        .expect("old worker claims the job");
+        let old_claim = claim_job_with_token(&config, &job.id, started)
+            .unwrap()
+            .expect("old worker claims the job");
 
         let wall_started = std::time::Instant::now();
-        let success = TEST_PERSIST_TIMEOUT
+        let result = TEST_PERSIST_TIMEOUT
             .scope(
                 Duration::from_millis(25),
                 TEST_PERSIST_BLOCK.scope(
@@ -4682,35 +4734,35 @@ mod tests {
                 ),
             )
             .await;
-        assert!(success);
+        assert!(!result.success);
+        assert_eq!(
+            result.output,
+            crate::i18n::get_required_cli_string("cron-result-persistence-pending")
+        );
         assert!(
             wall_started.elapsed() < Duration::from_millis(150),
             "scheduler must stop awaiting a blocked persistence worker"
         );
 
         assert_eq!(
-            clear_expired_claims(&config, started + ChronoDuration::seconds(2)).unwrap(),
-            1
+            crate::cron::store::current_claim_for_test(&config, &job.id).unwrap(),
+            old_claim
         );
-        let replacement = claim_job_with_lease(
-            &config,
-            &job.id,
-            started + ChronoDuration::seconds(2),
-            started + ChronoDuration::hours(1),
-        )
-        .unwrap()
-        .expect("replacement worker reclaims the expired lease");
+        assert!(
+            claim_job_with_token(&config, &job.id, started + ChronoDuration::days(365))
+                .unwrap()
+                .is_none(),
+            "a live owner cannot be replaced merely because wall-clock time passed"
+        );
 
         tokio::time::sleep(Duration::from_millis(250)).await;
+        let runs = cron::list_runs(&config, &job.id, 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].output.as_deref(), Some("late old result"));
         assert!(
-            cron::list_runs(&config, &job.id, 10).unwrap().is_empty(),
-            "the detached old worker must be fenced before writing run history"
+            crate::cron::store::current_claim_for_test(&config, &job.id).is_err(),
+            "the original owner releases atomically when its commit eventually finishes"
         );
-        assert_eq!(
-            crate::cron::store::current_claim_for_test(&config, &job.id).unwrap(),
-            replacement
-        );
-        assert!(release_claim(&config, &job.id, &replacement).unwrap());
     }
 
     #[tokio::test]
@@ -4785,7 +4837,10 @@ mod tests {
 
         let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
 
-        assert!(success);
+        assert!(
+            !success,
+            "a rolled-back completion must not be reported publicly as successful"
+        );
         assert!(cron::list_runs(&config, &job.id, 10).unwrap().is_empty());
 
         let stored = cron::get_job(&config, &job.id).unwrap();
@@ -4923,7 +4978,10 @@ mod tests {
         drop(conn);
 
         let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
-        assert!(success);
+        assert!(
+            !success,
+            "fallback state without durable run history is an incomplete persistence result"
+        );
 
         let runs = cron::list_runs(&config, &job.id, 10).unwrap();
         assert_eq!(runs.len(), 1);
@@ -4960,7 +5018,10 @@ mod tests {
         drop(conn);
 
         let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
-        assert!(success);
+        assert!(
+            !success,
+            "fallback disable without durable run history must not broadcast success"
+        );
 
         let updated = cron::get_job(&config, &job.id).unwrap();
         assert!(!updated.enabled);
@@ -5559,25 +5620,24 @@ mod tests {
     async fn broadcast_sends_cron_result_on_success() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp).await;
-        let job = test_job("echo broadcast-ok");
-        // Bind the synthetic test job to test-agent so process_due_jobs's
-        // owning-agent lookup succeeds (jobs without an owner are skipped).
+        let job = cron::add_job(&config, TEST_AGENT, "*/5 * * * *", "echo broadcast-ok").unwrap();
         config
             .agents
-            .get_mut("test-agent")
+            .get_mut(TEST_AGENT)
             .unwrap()
             .cron_jobs
             .push(job.id.clone());
+        assert!(cron::claim_job(&config, &job.id, Utc::now()).unwrap());
         let component = unique_component("broadcast-ok");
 
         let (tx, mut rx) = tokio::sync::broadcast::channel::<serde_json::Value>(16);
         let event_tx: EventBroadcast = Some(tx);
 
-        process_due_jobs(&config, vec![job], &component, &event_tx).await;
+        process_due_jobs(&config, vec![job.clone()], &component, &event_tx).await;
 
         let event = rx.try_recv().expect("should receive a broadcast event");
         assert_eq!(event["type"], "cron_result");
-        assert_eq!(event["job_id"], "test-job");
+        assert_eq!(event["job_id"], job.id);
         assert_eq!(event["success"], true);
         assert!(event["output"].as_str().unwrap().contains("broadcast-ok"));
         assert!(event["timestamp"].as_str().is_some());
@@ -5587,25 +5647,76 @@ mod tests {
     async fn broadcast_sends_cron_result_on_failure() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp).await;
-        let job = test_job("ls definitely_missing_file_for_broadcast_fail_test");
+        let job = cron::add_job(
+            &config,
+            TEST_AGENT,
+            "*/5 * * * *",
+            "ls definitely_missing_file_for_broadcast_fail_test",
+        )
+        .unwrap();
         config
             .agents
-            .get_mut("test-agent")
+            .get_mut(TEST_AGENT)
             .unwrap()
             .cron_jobs
             .push(job.id.clone());
+        assert!(cron::claim_job(&config, &job.id, Utc::now()).unwrap());
         let component = unique_component("broadcast-fail");
 
         let (tx, mut rx) = tokio::sync::broadcast::channel::<serde_json::Value>(16);
         let event_tx: EventBroadcast = Some(tx);
 
-        process_due_jobs(&config, vec![job], &component, &event_tx).await;
+        process_due_jobs(&config, vec![job.clone()], &component, &event_tx).await;
 
         let event = rx.try_recv().expect("should receive a broadcast event");
         assert_eq!(event["type"], "cron_result");
-        assert_eq!(event["job_id"], "test-job");
+        assert_eq!(event["job_id"], job.id);
         assert_eq!(event["success"], false);
         assert!(event["timestamp"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn broadcast_reports_pending_when_persistence_misses_deadline() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        let job = cron::add_job(&config, TEST_AGENT, "*/5 * * * *", "echo durable").unwrap();
+        config
+            .agents
+            .get_mut(TEST_AGENT)
+            .unwrap()
+            .cron_jobs
+            .push(job.id.clone());
+        assert!(cron::claim_job(&config, &job.id, Utc::now()).unwrap());
+        let component = unique_component("broadcast-persistence-pending");
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<serde_json::Value>(16);
+        let event_tx: EventBroadcast = Some(tx);
+
+        TEST_PERSIST_TIMEOUT
+            .scope(
+                Duration::from_millis(25),
+                TEST_PERSIST_BLOCK.scope(
+                    Duration::from_millis(200),
+                    process_due_jobs(&config, vec![job.clone()], &component, &event_tx),
+                ),
+            )
+            .await;
+
+        let event = rx
+            .try_recv()
+            .expect("pending persistence must be broadcast");
+        assert_eq!(event["type"], "cron_result");
+        assert_eq!(event["job_id"], job.id);
+        assert_eq!(event["success"], false);
+        assert_eq!(
+            event["output"],
+            crate::i18n::get_required_cli_string("cron-result-persistence-pending")
+        );
+        assert!(cron::list_runs(&config, &job.id, 10).unwrap().is_empty());
+        assert!(crate::cron::store::current_claim_for_test(&config, &job.id).is_ok());
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(cron::list_runs(&config, &job.id, 10).unwrap().len(), 1);
+        assert!(crate::cron::store::current_claim_for_test(&config, &job.id).is_err());
     }
 
     #[tokio::test]

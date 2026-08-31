@@ -15,14 +15,15 @@ pub use schedule::{
 };
 #[allow(unused_imports)]
 pub use store::{
-    add_agent_job, all_overdue_jobs, claim_job, clear_stale_locks, due_jobs, get_job,
-    get_job_for_agent, list_jobs, list_jobs_by_agent, list_runs, record_last_run,
-    record_last_run_with_status, record_run, release_job, remove_job, remove_job_for_agent,
-    remove_jobs_by_agent, rename_jobs_by_agent, reschedule_after_run,
-    reschedule_after_run_with_status, resolve_job_id_or_name, skip_missed_run,
-    sync_declarative_jobs, update_job, update_job_for_agent,
+    add_agent_job, all_overdue_jobs, clear_stale_locks, due_jobs, get_job, get_job_for_agent,
+    list_jobs, list_jobs_by_agent, list_runs, record_last_run, record_last_run_with_status,
+    record_run, remove_job, remove_job_for_agent, remove_jobs_by_agent, rename_jobs_by_agent,
+    reschedule_after_run, reschedule_after_run_with_status, resolve_job_id_or_name,
+    skip_missed_run, sync_declarative_jobs, update_job, update_job_for_agent,
 };
-pub(crate) use store::{claim_job_with_lease, clear_expired_claims, release_claim};
+#[cfg(test)]
+pub use store::{claim_job, release_job};
+pub(crate) use store::{claim_job_with_token, release_claim};
 pub use types::{
     CronJob, CronJobPatch, CronRun, DeliveryConfig, JobType, Schedule, SessionTarget,
     deserialize_maybe_stringified,
