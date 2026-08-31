@@ -246,13 +246,19 @@ fn archive_session_files(workspace_dir: &Path, archive_after_days: u32) -> Resul
         };
 
         if let Some((stem, transcript_suffix, metadata_suffix)) = jsonl_transcript_parts(filename) {
+            let metadata_path = sessions_dir.join(format!("{stem}{metadata_suffix}"));
+            // An empty transcript paired with ownership metadata is a live
+            // pre-message claim. Retain it until the first message arrives so
+            // delayed sessions cannot lose attribution at the age boundary.
+            if metadata_path.exists() && fs::metadata(&path)?.len() == 0 {
+                continue;
+            }
             let is_old = if let Some(date) = date_prefix(filename) {
                 date < cutoff_date
             } else {
                 is_older_than(&path, cutoff_time)
             };
             if is_old {
-                let metadata_path = sessions_dir.join(format!("{stem}{metadata_suffix}"));
                 if metadata_path.exists() {
                     move_jsonl_pair_to_archive(
                         &path,
@@ -273,22 +279,16 @@ fn archive_session_files(workspace_dir: &Path, archive_after_days: u32) -> Resul
 
         if let Some((stem, transcript_suffix)) = jsonl_metadata_parts(filename) {
             // A sidecar with a live transcript is handled as a pair when the
-            // transcript reaches its retention boundary. Metadata-only ghosts
-            // are archived independently so they cannot remain live forever.
+            // transcript reaches its retention boundary. A metadata-only file
+            // can be a trusted ownership claim made before the first message;
+            // retain it so a delayed append cannot lose attribution. Current
+            // writers materialize an empty transcript with every claim, while
+            // this compatibility path protects claims written by older builds.
             if sessions_dir
                 .join(format!("{stem}{transcript_suffix}"))
                 .exists()
             {
                 continue;
-            }
-            let is_old = if let Some(date) = date_prefix(filename) {
-                date < cutoff_date
-            } else {
-                is_older_than(&path, cutoff_time)
-            };
-            if is_old {
-                move_to_archive(&path, &archive_dir)?;
-                moved += 1;
             }
             continue;
         }
@@ -823,6 +823,84 @@ mod tests {
                 .exists(),
             "ownership sidecar must be archived with its transcript"
         );
+    }
+
+    #[test]
+    fn retains_legacy_metadata_only_claim_until_first_message() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path();
+        let sessions_dir = workspace.join("sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+
+        let metadata_file = sessions_dir.join("delayed.metadata.json");
+        fs::write(&metadata_file, r#"{"agent_alias":"agent_a"}"#).unwrap();
+        set_old_mtime(&metadata_file, 10);
+
+        run_if_due(&default_cfg(), workspace).unwrap();
+
+        assert!(
+            metadata_file.exists(),
+            "a pre-message ownership claim must remain active"
+        );
+        assert!(
+            !sessions_dir
+                .join("archive")
+                .join("delayed.metadata.json")
+                .exists()
+        );
+
+        fs::write(
+            sessions_dir.join("delayed.jsonl"),
+            serde_json::to_string(&zeroclaw_api::model_provider::ChatMessage::user("first"))
+                .unwrap(),
+        )
+        .unwrap();
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&fs::read(metadata_file).unwrap()).unwrap();
+        assert_eq!(metadata["agent_alias"], "agent_a");
+    }
+
+    #[test]
+    fn retains_materialized_empty_claim_until_first_message() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path();
+        let sessions_dir = workspace.join("sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+
+        let transcript_file = sessions_dir.join("delayed.jsonl");
+        let metadata_file = sessions_dir.join("delayed.metadata.json");
+        fs::write(&transcript_file, "").unwrap();
+        fs::write(&metadata_file, r#"{"agent_alias":"agent_a"}"#).unwrap();
+        set_old_mtime(&transcript_file, 10);
+        set_old_mtime(&metadata_file, 10);
+
+        run_if_due(&default_cfg(), workspace).unwrap();
+
+        assert!(
+            transcript_file.exists(),
+            "an empty claimed transcript must remain active"
+        );
+        assert!(
+            metadata_file.exists(),
+            "ownership metadata must remain until the first message"
+        );
+        assert!(!sessions_dir.join("archive").join("delayed.jsonl").exists());
+        assert!(
+            !sessions_dir
+                .join("archive")
+                .join("delayed.metadata.json")
+                .exists()
+        );
+
+        fs::write(
+            transcript_file,
+            serde_json::to_string(&zeroclaw_api::model_provider::ChatMessage::user("first"))
+                .unwrap(),
+        )
+        .unwrap();
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&fs::read(metadata_file).unwrap()).unwrap();
+        assert_eq!(metadata["agent_alias"], "agent_a");
     }
 
     #[test]

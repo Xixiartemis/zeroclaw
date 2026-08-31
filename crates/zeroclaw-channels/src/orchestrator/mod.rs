@@ -6022,10 +6022,14 @@ fn stamp_session_routing_context(
         return;
     };
 
-    let channel_id = msg
-        .channel_alias
-        .as_deref()
-        .map(|alias| format!("{}.{alias}", msg.channel));
+    let channel_id = if msg.channel.trim().is_empty() {
+        None
+    } else {
+        Some(msg.channel_alias.as_deref().map_or_else(
+            || msg.channel.clone(),
+            |alias| format!("{}.{alias}", msg.channel),
+        ))
+    };
     let room_id = msg
         .thread_ts
         .as_deref()
@@ -12054,6 +12058,13 @@ fn hydrate_persisted_session_history(
     agent_ctxs: &HashMap<String, Arc<ChannelRuntimeContext>>,
     owner_by_channel_key: &HashMap<String, String>,
 ) -> Option<bool> {
+    // The shared backend also holds gateway and RPC chat rows. A trusted
+    // channel marker is required before channel startup may hydrate or mutate
+    // a transcript; agent attribution alone identifies the owner, not the
+    // subsystem that owns restoration.
+    if metadata.channel_id.as_deref().is_none_or(str::is_empty) {
+        return None;
+    }
     let owner_agent = metadata.agent_alias.clone().or_else(|| {
         metadata
             .channel_id
@@ -12791,6 +12802,12 @@ pub async fn start_channels(
     // without an agent attribution.
     if let Some(ref store) = shared_session_store {
         let mut metadata = store.list_sessions_with_metadata();
+        metadata.retain(|session| {
+            session
+                .channel_id
+                .as_deref()
+                .is_some_and(|channel_id| !channel_id.is_empty())
+        });
         metadata.sort_by_key(|m| std::cmp::Reverse(m.last_activity));
         // Budget proportional to the number of agents — each gets up to
         // `MAX_CONVERSATION_SENDERS` slots, so a multi-agent install
@@ -15037,9 +15054,18 @@ temperature = 0.3
                 ..Default::default()
             },
         );
-        let enabled_agents = vec!["alpha-agent".to_string(), "beta-agent".to_string()];
-        let collected_keys = vec!["webhook.alpha".to_string(), "webhook.beta".to_string()];
-        let owners = build_owner_by_channel_key(&config, &enabled_agents, &collected_keys);
+        for alias in ["alpha", "beta"] {
+            config.channels.webhook.insert(
+                alias.to_string(),
+                zeroclaw_config::schema::WebhookConfig {
+                    enabled: true,
+                    ..Default::default()
+                },
+            );
+        }
+        let owners = config
+            .active_agent_channel_bindings()
+            .owner_by_channel_key();
         let router = AgentRouter::multi(
             HashMap::from([
                 ("alpha-agent".to_string(), Arc::clone(&alpha_ctx)),
@@ -15143,11 +15169,18 @@ temperature = 0.3
                 ..Default::default()
             },
         );
-        let owners = build_owner_by_channel_key(
-            &config,
-            &["shared-agent".to_string()],
-            &["webhook.alpha".to_string(), "webhook.beta".to_string()],
-        );
+        for alias in ["alpha", "beta"] {
+            config.channels.webhook.insert(
+                alias.to_string(),
+                zeroclaw_config::schema::WebhookConfig {
+                    enabled: true,
+                    ..Default::default()
+                },
+            );
+        }
+        let owners = config
+            .active_agent_channel_bindings()
+            .owner_by_channel_key();
         let router = AgentRouter::multi(
             HashMap::from([("shared-agent".to_string(), Arc::clone(&shared_ctx))]),
             owners,
@@ -15254,7 +15287,7 @@ temperature = 0.3
                 thread: None,
                 reply_target: "stdin",
                 sender: "cli-user",
-                expected_channel: None,
+                expected_channel: Some("cli"),
                 expected_room: Some("stdin"),
                 expected_sender: Some("cli-user"),
             },
@@ -15372,7 +15405,22 @@ temperature = 0.3
                     .append(key, &ChatMessage::assistant(format!("history for {key}")))
                     .unwrap();
             }
+            for key in ["gw_browser", "rpc_chat"] {
+                store
+                    .append(key, &ChatMessage::user(format!("pending {key}")))
+                    .unwrap();
+                store.set_session_agent_alias(key, "alpha").unwrap();
+            }
             store.set_session_agent_alias("aliasless", "alpha").unwrap();
+            store
+                .set_session_context(
+                    "aliasless",
+                    SessionContext {
+                        channel_id: Some("webhook"),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
             store
                 .set_session_agent_alias("mixed-owner", "alpha")
                 .unwrap();
@@ -15434,13 +15482,21 @@ temperature = 0.3
             .unwrap_or_else(|error| error.into_inner());
         assert!(
             alpha_histories.peek("aliasless").is_some(),
-            "an alias-less channel session must hydrate from its persisted agent owner"
+            "an alias-less channel session must hydrate from its persisted channel marker and agent owner"
         );
         assert!(
             alpha_histories.peek("mixed-owner").is_some(),
             "explicit agent attribution must win over current channel routing"
         );
         assert!(alpha_histories.peek("disabled-owner").is_none());
+        assert!(
+            alpha_histories.peek("gw_browser").is_none(),
+            "channel startup must not hydrate a gateway transcript"
+        );
+        assert!(
+            alpha_histories.peek("rpc_chat").is_none(),
+            "channel startup must not hydrate an RPC transcript"
+        );
         drop(alpha_histories);
 
         let beta_histories = beta
@@ -15455,6 +15511,17 @@ temperature = 0.3
             beta_histories.peek("disabled-owner").is_none(),
             "a stale or disabled explicit owner must fail closed"
         );
+        drop(beta_histories);
+
+        for key in ["gw_browser", "rpc_chat"] {
+            let messages = store.load(key);
+            assert_eq!(
+                messages.len(),
+                1,
+                "{key} must not receive a channel closure"
+            );
+            assert_eq!(messages[0].role, "user");
+        }
     }
 
     #[tokio::test]

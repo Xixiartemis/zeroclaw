@@ -170,6 +170,15 @@ impl SessionStore {
     {
         let mut metadata = self.read_metadata(session_key)?.unwrap_or_default();
         update(&mut metadata);
+        // A sidecar is a claim on a real zero-or-more-message session, not a
+        // standalone session representation. Materialize the empty transcript
+        // first so hygiene, migration, and later appends always move the
+        // ownership fact with its canonical message file.
+        let transcript = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.session_path(session_key))?;
+        transcript.sync_all()?;
         self.write_metadata_unlocked(session_key, &metadata)
     }
 
@@ -1160,6 +1169,26 @@ mod tests {
         assert_eq!(backend.count_agent_attribution("sable").unwrap(), 2);
         assert_eq!(backend.clear_agent_attribution("sable").unwrap(), 2);
         assert_eq!(backend.count_agent_attribution("sable").unwrap(), 0);
+    }
+
+    #[test]
+    fn ownership_claim_materializes_an_empty_transcript() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let backend: &dyn SessionBackend = &store;
+
+        backend
+            .set_session_agent_alias("claimed-before-first-message", "rowan")
+            .unwrap();
+
+        let transcript = store.session_path("claimed-before-first-message");
+        assert!(transcript.exists());
+        assert_eq!(std::fs::metadata(transcript).unwrap().len(), 0);
+        let metadata = backend
+            .get_session_metadata("claimed-before-first-message")
+            .unwrap();
+        assert_eq!(metadata.agent_alias.as_deref(), Some("rowan"));
+        assert_eq!(metadata.message_count, 0);
     }
 
     #[test]

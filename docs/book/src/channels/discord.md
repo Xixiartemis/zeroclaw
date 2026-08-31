@@ -96,6 +96,10 @@ which configured channel wrote it, and `discord_search` only returns rows
 belonging to the calling agent's own Discord channels. Rows archived by
 older versions carry no channel attribution: a single-agent install still
 sees them, while a multi-agent install hides them from every agent.
+Edits, deletes, bulk deletes, and reaction removals pass the same configured
+guild/channel admission gates as message creation and mutate a row only while
+its stored channel and alias provenance still match. An event observed by one
+Discord alias therefore cannot relabel or remove another alias's archive row.
 
 ## Streaming
 

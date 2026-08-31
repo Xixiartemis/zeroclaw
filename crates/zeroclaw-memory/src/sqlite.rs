@@ -1745,6 +1745,32 @@ impl Memory for SqliteMemory {
         .await?
     }
 
+    async fn forget_if_provenance(
+        &self,
+        key: &str,
+        namespace: &str,
+        session_id: Option<&str>,
+        agent_id: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        let conn = self.conn.clone();
+        let key = key.to_string();
+        let namespace = namespace.to_string();
+        let session_id = session_id.map(str::to_string);
+        let agent_id = agent_id.map(str::to_string);
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+            let conn = conn.lock();
+            let affected = conn.execute(
+                "DELETE FROM memories
+                 WHERE key = ?1 AND namespace = ?2
+                   AND session_id IS ?3 AND agent_id IS ?4",
+                params![key, namespace, session_id, agent_id],
+            )?;
+            Ok(affected > 0)
+        })
+        .await?
+    }
+
     async fn forget_for_agent(&self, key: &str, agent_id: &str) -> anyhow::Result<bool> {
         let conn = self.conn.clone();
         let key = key.to_string();
@@ -2122,6 +2148,59 @@ impl Memory for SqliteMemory {
             None,
         )
         .await
+    }
+
+    async fn update_content_if_provenance(
+        &self,
+        key: &str,
+        content: &str,
+        namespace: &str,
+        session_id: Option<&str>,
+        agent_id: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        let embedding_bytes = match self.get_or_compute_embedding(content).await {
+            Ok(embedding) => embedding.map(|embedding| vector::vec_to_bytes(&embedding)),
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "key": key,
+                            "error": error.to_string(),
+                        })),
+                    "memory conditional update: embedding failed; persisting content without a vector"
+                );
+                None
+            }
+        };
+        let conn = self.conn.clone();
+        let key = key.to_string();
+        let content = content.to_string();
+        let namespace = namespace.to_string();
+        let session_id = session_id.map(str::to_string);
+        let agent_id = agent_id.map(str::to_string);
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+            let conn = conn.lock();
+            let affected = conn.execute(
+                "UPDATE memories
+                 SET content = ?1, embedding = ?2, updated_at = ?3
+                 WHERE key = ?4 AND namespace = ?5
+                   AND session_id IS ?6 AND agent_id IS ?7",
+                params![
+                    content,
+                    embedding_bytes,
+                    Local::now().to_rfc3339(),
+                    key,
+                    namespace,
+                    session_id,
+                    agent_id,
+                ],
+            )?;
+            Ok(affected > 0)
+        })
+        .await?
     }
 
     async fn store_with_options(
@@ -4257,6 +4336,75 @@ mod tests {
     }
 
     // ── Bulk deletion tests ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn provenance_conditional_update_and_delete_fail_closed() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store_with_metadata(
+            "discord_1",
+            "original",
+            MemoryCategory::Custom("discord".into()),
+            Some("channel-1"),
+            Some("discord.owner"),
+            None,
+        )
+        .await
+        .unwrap();
+        let entry = mem.get("discord_1").await.unwrap().unwrap();
+
+        assert!(
+            !mem.update_content_if_provenance(
+                "discord_1",
+                "foreign update",
+                "discord.observer",
+                Some("channel-1"),
+                entry.agent_id.as_deref(),
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            !mem.forget_if_provenance(
+                "discord_1",
+                "discord.owner",
+                Some("foreign-channel"),
+                entry.agent_id.as_deref(),
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            mem.get("discord_1").await.unwrap().unwrap().content,
+            "original"
+        );
+
+        assert!(
+            mem.update_content_if_provenance(
+                "discord_1",
+                "owned update",
+                "discord.owner",
+                Some("channel-1"),
+                entry.agent_id.as_deref(),
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            mem.get("discord_1").await.unwrap().unwrap().content,
+            "owned update"
+        );
+        assert!(
+            mem.forget_if_provenance(
+                "discord_1",
+                "discord.owner",
+                Some("channel-1"),
+                entry.agent_id.as_deref(),
+            )
+            .await
+            .unwrap()
+        );
+        assert!(mem.get("discord_1").await.unwrap().is_none());
+    }
 
     #[tokio::test]
     async fn sqlite_purge_namespace_deletes_only_all_matching_entries() {
