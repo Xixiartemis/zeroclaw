@@ -61,45 +61,47 @@ Each live case runs inside a sandbox:
 | Control | Behavior |
 |---|---|
 | Workspace | Fresh per-case temp directory; `workspace_only` policy blocks reads and writes outside it. |
-| Tool registry | Runtime default tools filtered to `case.tools` intersected with `[eval].live_allowed_tools`; empty allowlist yields only the harmless echo tool. |
-| Shell / subprocesses | If `shell` is in the effective tool set, its subprocesses are wrapped in a real OS sandbox backend (Landlock on Linux with the `sandbox-landlock` feature, Firejail on Linux otherwise, `sandbox-exec` on macOS). If no real backend is available on the platform, the case fails closed before the agent runs (a clear error naming the missing backend) rather than running `shell` unsandboxed. |
+| Tool registry | Runtime default tools filtered to `case.tools` intersected with `[eval].live_allowed_tools`, then `shell` is dropped unconditionally (see "Shell is excluded" below); empty allowlist yields only the harmless echo tool. |
 | Autonomy | `Supervised`, never `Full`. |
 | Approvals | Non-interactive backchannel manager: allowlisted tools auto-approve; anything else that reaches the approval gate is auto-denied (deterministic case failure). |
 | Timeout | Each turn is bounded by `[eval].case_timeout_secs` (default 120); a slow turn fails the case rather than hanging. |
 
-### Residual host access
+### Shell is excluded
 
-The shell sandbox confines subprocesses; it does not grant an airtight boundary,
-and operators relying on it should know exactly what it still permits.
+`shell` can never be part of the live tool surface, even when a case's `tools`
+and `[eval].live_allowed_tools` both request it — `effective_live_tools`
+(`crates/zeroclaw-eval/src/live.rs`) applies a hard denylist to the allowlist
+intersection, so deny always wins. A scripted `shell` tool call in a live case
+reaches the agent's tool-dispatch path and fails there ("tool not available"),
+rather than executing.
+
+This is the ship-safe interim posture chosen on the #9214 review thread. An
+earlier version of this harness wrapped `shell`'s subprocesses in a real OS
+sandbox backend (Landlock, Firejail, or `sandbox-exec`) instead of excluding
+it outright, but every accepted backend still permitted host *reads* wide
+enough to leak host data back into the conversation sent to a real provider:
 
 - Linux, Landlock (`sandbox-landlock` feature): the child process's filesystem
-  access is confined to the case workspace plus a blanket `/tmp` allowance,
-  with `/usr` and `/bin` readable (for executing commands). Within the
-  workspace and `/tmp`, the child may read and write existing files, list
-  directories, and create or remove regular files, directories, and symlinks
-  (`MakeReg`, `MakeDir`, `RemoveFile`, `RemoveDir`, `MakeSym`); creating device
-  nodes, sockets, or named pipes stays denied everywhere, workspace included.
-  Outside the workspace and `/tmp` (and the read-only `/usr`, `/bin`), all of
-  these operations, including plain file creation, are denied. Network is NOT
-  restricted by Landlock as configured here (no `AccessNet` rule); a sandboxed
-  shell command can still reach the network freely. Because each case's own
-  workspace is itself created under `/tmp`, the effective write boundary is
-  "workspace plus the system temp tree", not strict workspace-only
-  confinement.
-- macOS, `sandbox-exec` (Seatbelt): deny-by-default policy. Writes are allowed
-  to the workspace, `/tmp`, `/private/tmp`, and `/private/var/folders/**`.
-  Reads are allowed more broadly: the write locations above, plus system
-  paths (`/usr`, `/bin`, `/sbin`, `/Library`, `/System`, `/etc`, `/opt`, and
-  others) and the invoking user's dotfile directories under `$HOME`. Network
-  is denied by default except DNS resolution (via `mDNSResponder`) and
-  localhost connections.
-- No backend available (Windows; Linux without `sandbox-landlock` or
-  Firejail installed): a live case that requests `shell` errors before the
-  agent runs at all (fail closed), rather than falling back to an
-  unsandboxed shell.
-- Linux network confinement (blocking outbound network entirely, not just
-  filesystem access) needs Landlock ABI v4 (`AccessNet`, kernel 6.7+) and is
-  a known follow-up, not implemented by the current sandbox construction.
+  access was confined to the case workspace plus a blanket `/tmp` allowance,
+  with `/usr` and `/bin` readable. Network was NOT restricted (no `AccessNet`
+  rule); a sandboxed shell command could still reach the network freely.
+- macOS, `sandbox-exec` (Seatbelt): deny-by-default for writes, but reads were
+  allowed broadly — system paths (`/usr`, `/bin`, `/sbin`, `/Library`,
+  `/System`, `/etc`, `/opt`, and others) and the invoking user's dotfile
+  directories under `$HOME`.
+- Firejail (Linux, no `sandbox-landlock` feature): `--private=home` with
+  `--noprofile` added no workspace whitelist, read-only host-root rule, or
+  network restriction beyond that.
+
+Confining the *writes* (which those backends do well; see
+`crates/zeroclaw-eval/tests/live_shell_sandbox.rs`'s history for the escape
+tests this proved) was not sufficient, because live-mode tool output becomes
+part of the conversation sent to the configured provider — a confidentiality
+boundary, not just an integrity one. Re-admitting `shell` needs an
+eval-specific sandbox contract that also denies sensitive host reads on every
+accepted backend; that is a deliberate, tracked follow-up, not implemented
+here. `live_shell_sandbox`/`ensure_real_sandbox` (the OS-sandbox construction
+`shell` used to run under) remain in `live.rs` as building blocks for it.
 
 Because live output is non-deterministic and can embed workspace content, live runs
 belong in the planned `evals/live/` suite, not the gating regression suite.

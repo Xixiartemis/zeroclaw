@@ -21,12 +21,59 @@ use crate::observer::RecordingObserver;
 use crate::record::RunRecord;
 use crate::runner::{CaseProvider, RunDeps};
 
+/// Tools that must never reach the live-mode tool surface, no matter what a
+/// case's `tools` or `[eval].live_allowed_tools` request. Checked in
+/// [`effective_live_tools`] *after* the allowlist intersection, so deny
+/// always wins over both inputs.
+///
+/// Live-mode tool output becomes part of the conversation sent to a real,
+/// configured provider (see the #9214 review thread). `shell` runs an
+/// arbitrary subprocess whose command line is only screened by a heuristic
+/// app-layer string scan (`SecurityPolicy::forbidden_path_argument`), not
+/// the structural path-canonicalization confinement the file tools get
+/// (`file_read`/`file_write`/`file_edit`/`glob_search`/`content_search`/
+/// `deliver_file` all resolve and bind their target path against the
+/// workspace root before touching disk). Even wrapped in the best OS sandbox
+/// backend this codebase can construct today
+/// (`live_shell_sandbox`/`ensure_real_sandbox`), every accepted backend
+/// still permits host reads that boundary never claimed to close:
+///
+/// - Seatbelt (macOS, `sandbox-exec`): explicitly allows reads from the
+///   invoking user's dotfile directories and broad system/temp paths.
+/// - Firejail (Linux, no `sandbox-landlock` feature): `--private=home` with
+///   `--noprofile` adds no workspace whitelist, read-only host-root rule, or
+///   network restriction.
+/// - Landlock (Linux, `sandbox-landlock` feature): grants the whole `/tmp`
+///   tree read/write/create/remove access and leaves network unrestricted.
+///
+/// A model-directed shell command can read that host data (SSH keys, shell
+/// history, cloud credentials, etc.) and hand it back as tool output, which
+/// the live agent then sends to the real provider on the next turn -
+/// confidentiality leakage no amount of sandboxing-the-writes fixes.
+///
+/// This is the ship-safe interim posture: the reviewer's two accepted
+/// options were "either keep `shell` unavailable in live mode or provide an
+/// eval-specific sandbox contract that denies sensitive host reads as well
+/// as outside writes on every accepted backend." The read-confinement
+/// contract is the deliberate, harder follow-up; `live_shell_sandbox` /
+/// `ensure_real_sandbox` and `live_tool_registry`'s sandboxed-shell
+/// construction below are left in place as building blocks for it, even
+/// though this denylist means `run_live_case` can no longer reach that
+/// branch with `"shell"` in `effective`.
+const LIVE_TOOL_DENYLIST: &[&str] = &["shell"];
+
 /// Intersect a case's requested tools with the config allowlist, preserving the
-/// allowlist's order and de-duplicating. An empty allowlist yields no tools.
+/// allowlist's order and de-duplicating, then drop anything in
+/// [`LIVE_TOOL_DENYLIST`]. Deny always wins: a tool present in both a case's
+/// `tools` and `[eval].live_allowed_tools` is still excluded when
+/// denylisted. An empty allowlist yields no tools.
 pub fn effective_live_tools(requested: Option<&[String]>, allowed: &[String]) -> Vec<String> {
     let requested = requested.unwrap_or(&[]);
     let mut out: Vec<String> = Vec::new();
     for tool in allowed {
+        if LIVE_TOOL_DENYLIST.contains(&tool.as_str()) {
+            continue;
+        }
         if requested.iter().any(|r| r == tool) && !out.iter().any(|o| o == tool) {
             out.push(tool.clone());
         }
@@ -68,6 +115,15 @@ pub fn write_setup_files(workspace: &Path, setup: &CaseSetup) -> anyhow::Result<
 /// the runtime default tools (unsandboxed shell tool included, but filtered
 /// out below) are used as-is, and the registry filter is the primary guard; the
 /// builder allowlist (set by the caller) is defense in depth.
+///
+/// In practice, `run_live_case` never calls this with `"shell"` present in
+/// `effective`: [`effective_live_tools`] drops it via [`LIVE_TOOL_DENYLIST`]
+/// before this function ever sees it, since no accepted OS sandbox backend
+/// confines `shell`'s host *reads* the way the write-confinement tests here
+/// prove for writes. The sandboxed-shell branch below is kept as the
+/// building block for the deferred follow-up (a read-confining eval sandbox
+/// contract), not dead code to delete; it remains directly testable via this
+/// function and `live_shell_sandbox`/`ensure_real_sandbox`.
 fn live_tool_registry(
     effective: &[String],
     policy: Arc<SecurityPolicy>,
@@ -238,7 +294,7 @@ mod tests {
     use std::time::Duration;
     use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
     use zeroclaw_api::model_provider::{
-        ChatRequest, ChatResponse, ModelProvider, ProviderCapabilities,
+        ChatRequest, ChatResponse, ConversationMessage, ModelProvider, ProviderCapabilities,
     };
 
     /// Build a `RunDeps` for the live path with an injected provider factory.
@@ -270,6 +326,92 @@ mod tests {
         assert_eq!(
             effective_live_tools(Some(&requested), &allowed),
             vec!["echo".to_string()]
+        );
+    }
+
+    #[test]
+    fn live_effective_tools_denies_shell_even_when_case_and_config_both_request_it() {
+        // The exact scenario the #9214 review flagged: a case's `tools` asks
+        // for `shell` *and* the operator's `[eval].live_allowed_tools`
+        // config (the `allowed` argument here) explicitly permits it. The
+        // hard denylist must still win over both, leaving only the
+        // non-denylisted tool in the effective set.
+        let requested = ["shell".to_string(), "file_write".to_string()];
+        let allowed = ["shell".to_string(), "file_write".to_string()];
+        assert_eq!(
+            effective_live_tools(Some(&requested), &allowed),
+            vec!["file_write".to_string()],
+            "shell must never be part of the live tool surface, even when \
+             both the case and [eval].live_allowed_tools request it"
+        );
+    }
+
+    #[test]
+    fn live_effective_tools_denies_shell_only_request() {
+        // A case (and config) that requests nothing but `shell` must end up
+        // with an empty effective tool set, not a one-element set containing
+        // the denylisted tool.
+        let requested = ["shell".to_string()];
+        let allowed = ["shell".to_string()];
+        assert!(effective_live_tools(Some(&requested), &allowed).is_empty());
+    }
+
+    #[tokio::test]
+    async fn live_case_never_dispatches_shell_even_when_allowlisted() {
+        // End-to-end companion to the `effective_live_tools` unit tests
+        // above: even when the case's `tools` and `deps.live_tools` (what
+        // `[eval].live_allowed_tools` populates in the real CLI path) both
+        // list "shell", a scripted `shell` tool call must never actually
+        // execute.
+        //
+        // Because `shell` is excluded from `effective`, it is also excluded
+        // from `risk.auto_approve` (both are built from the same
+        // `effective.clone()` in `run_live_case`), so the approval gate
+        // resolves its requirement to `Prompt` and auto-denies it - no
+        // interactive/channel backchannel is wired here - *before* the call
+        // ever reaches tool dispatch. That means it never shows up in
+        // `tools_called`/`all_tools_succeeded` at all (see
+        // `crate::agent::turn::approval_gate::gate_tool_approval`'s `Deny`
+        // path, which returns straight to `prepare_tool_calls` without
+        // touching the observer). The real proof the call never ran is in
+        // the fed-back conversation history: a "Denied by user." tool
+        // result, not any shell output.
+        let trace: LlmTrace = serde_json::from_str(
+            r#"{ "model_name": "shell-denied", "turns": [{ "user_input": "hi" }], "tools": ["shell"] }"#,
+        )
+        .unwrap();
+
+        let driver = r#"{"model_name":"driver","turns":[{"user_input":"","steps":[
+            {"response":{"type":"tool_calls","tool_calls":[{"id":"1","name":"shell","arguments":{"command":"echo hi"}}]}},
+            {"response":{"type":"text","content":"done"}}
+        ]}]}"#;
+
+        let deps = live_deps(
+            move |_| Ok(driver_provider(driver)),
+            vec!["shell".to_string()],
+            Duration::from_secs(5),
+        );
+
+        let record = run_live_case(&trace, &deps).await.unwrap();
+        assert!(
+            !record.tools_called.contains(&"shell".to_string()),
+            "shell must be auto-denied before it ever reaches tool \
+             dispatch, so it must not appear as a dispatched tool call: {:?}",
+            record.tools_called
+        );
+        let denied = record.history.iter().any(|msg| {
+            matches!(
+                msg,
+                ConversationMessage::ToolResults(results)
+                    if results.iter().any(|r| r.content == "Denied by user.")
+            )
+        });
+        assert!(
+            denied,
+            "the shell call must be auto-denied by the approval gate \
+             (proving it never actually ran), but no denial was recorded \
+             in history: {:?}",
+            record.history
         );
     }
 

@@ -242,6 +242,11 @@ pub struct EvalHarnessConfig {
     pub live_provider: crate::providers::ModelProviderRef,
     /// Tool names live-mode cases may use. A case's requested tools are
     /// intersected with this list; the default (empty) allows no real tools.
+    /// `shell` can never actually be admitted this way: `zeroclaw-eval`'s
+    /// live tool surface hard-denies it (see
+    /// `zeroclaw_eval::live::LIVE_TOOL_DENYLIST`) regardless of what this
+    /// list contains, because live output reaches a real provider and no
+    /// accepted OS sandbox backend confines what `shell` can read.
     #[serde(default)]
     pub live_allowed_tools: Vec<String>,
     /// Wall-clock timeout per conversation turn in live mode, seconds.

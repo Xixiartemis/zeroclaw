@@ -63,7 +63,10 @@ pub struct RunDeps {
     pub mode: Mode,
     /// Builds the model provider for one case run.
     pub provider: ProviderFactory,
-    /// Config tool allowlist for live runs; intersected per case with `case.tools`.
+    /// Config tool allowlist for live runs; intersected per case with
+    /// `case.tools` by `live::effective_live_tools`, which then drops any
+    /// tool in `live::LIVE_TOOL_DENYLIST` (e.g. `shell`) regardless of
+    /// whether it appears here.
     pub live_tools: Vec<String>,
     /// Wall-clock timeout applied per conversation turn in live mode.
     pub case_timeout: Duration,
