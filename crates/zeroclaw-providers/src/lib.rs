@@ -37,7 +37,7 @@ pub use dispatch::{AccountedChatResponse, ProviderDispatch, ProviderDispatchRef}
 pub use reliable::{ReliableRejectedCompletionUsage, ReliableSemanticEmptyCompletion};
 pub use safeguard_notice::{
     SafeguardFallbackKind, SafeguardFallbackNotice, commit_safeguard_fallback,
-    peek_last_safeguard_fallback, scope_safeguard_fallback, take_last_safeguard_fallback,
+    scope_safeguard_fallback, take_last_safeguard_fallback,
 };
 
 /// Return billed usage carried by a rejected provider result.

@@ -2,8 +2,8 @@
 //!
 //! Mirrors the task-local contract of [`crate::reliable::ProviderFallbackInfo`]:
 //! the accepted-response owner commits at most one notice per turn via
-//! [`commit_safeguard_fallback`], and the post-loop delivery boundary reads
-//! it via [`take_last_safeguard_fallback`]. Both must run inside a
+//! [`commit_safeguard_fallback`], and the runtime turn boundary reads it via
+//! [`take_last_safeguard_fallback`]. Both must run inside a
 //! [`scope_safeguard_fallback`] scope for the data to be visible; outside a
 //! scope, commit/peek/take are silent no-ops.
 
@@ -45,20 +45,9 @@ pub fn take_last_safeguard_fallback() -> Option<SafeguardFallbackNotice> {
         .flatten()
 }
 
-/// Read the accepted safeguard notice without consuming it.
-///
-/// The agent uses this to suppress its generic fallback text when the outer
-/// delivery surface will publish the richer safeguard event.
-pub fn peek_last_safeguard_fallback() -> Option<SafeguardFallbackNotice> {
-    SAFEGUARD_FALLBACK
-        .try_with(|cell| cell.borrow().clone())
-        .ok()
-        .flatten()
-}
-
 /// Run the given future within a safeguard-fallback scope.
 /// Both `commit_safeguard_fallback` (inside the accepted-response owner) and
-/// `take_last_safeguard_fallback` (post-loop channel code) must execute
+/// `take_last_safeguard_fallback` (the runtime turn boundary) must execute
 /// within this scope for the data to be visible.
 pub async fn scope_safeguard_fallback<F: Future>(future: F) -> F::Output {
     SAFEGUARD_FALLBACK.scope(RefCell::new(None), future).await

@@ -1098,16 +1098,10 @@ async fn process_chat_message(
 
     let content_owned = content.to_string();
     let session_key_owned = session_key.to_string();
-    // Enclose the whole tool-loop call in a safeguard-fallback scope so the
-    // record calls buried in provider code (client-side reliability retry via
-    // `fallback_models`, or Anthropic server-side fallback) are visible, then
-    // drain the at-most-one notice inside the scope after the loop returns.
-    // `Box::pin` keeps this large turn future on the heap: without boxing,
-    // adding the `TaskLocalFuture` scope layer overflows the debug-build stack
-    // when it is polled (the same lesson the channel orchestrator learned).
-    // The drained notice is display-only — surfaced as a standalone WS frame
-    // below and never written into the persisted transcript.
-    let turn_fut = zeroclaw_providers::scope_safeguard_fallback(Box::pin(async {
+    // The shared Agent turn boundary owns safeguard attribution and returns it
+    // alongside the undecorated transcript. This transport only renders the
+    // typed result as a standalone WS frame.
+    let turn_fut = Box::pin(async {
         use ::zeroclaw_log::Instrument as _;
         let span = ::zeroclaw_log::info_span!(
             target: "zeroclaw_log_internal_scope",
@@ -1118,7 +1112,7 @@ async fn process_chat_message(
             model = %turn_model,
             channel = WS_CHANNEL_KEY,
         );
-        let result = zeroclaw_runtime::agent::loop_::scope_session_key(
+        zeroclaw_runtime::agent::loop_::scope_session_key(
             Some(session_key_owned.clone()),
             zeroclaw_runtime::agent::cost::TOOL_LOOP_TURN_USAGE.scope(
                 turn_usage.clone(),
@@ -1135,10 +1129,8 @@ async fn process_chat_message(
                 ),
             ),
         )
-        .await;
-        let safeguard_notice = zeroclaw_providers::take_last_safeguard_fallback();
-        (result, safeguard_notice)
-    }));
+        .await
+    });
 
     // Drive both futures concurrently: the agent turn produces events
     // and we relay them over WebSocket. Track streamed chunks so we
@@ -1347,7 +1339,7 @@ async fn process_chat_message(
         }
     };
 
-    let ((result, safeguard_notice), ()) = tokio::join!(turn_fut, forward_fut);
+    let (result, ()) = tokio::join!(turn_fut, forward_fut);
 
     // ── Remove cancel token (turn finished) ──────────────────────
     {
@@ -1518,6 +1510,7 @@ async fn process_chat_message(
             // `outcome.new_messages`, so it is not persisted into the session
             // transcript. Privacy: only the model names cross the wire — the
             // classifier `category` (and any refusal explanation) never do.
+            let safeguard_notice = outcome.safeguard_fallback.as_ref();
             let done = serde_json::json!({
                 "type": "done",
                 "full_response": outcome.response,
@@ -1530,7 +1523,7 @@ async fn process_chat_message(
                 "max_context_tokens": max_context_tokens,
                 "last_input_tokens": last_input_tokens,
             });
-            for frame in success_terminal_ws_frames(safeguard_notice.as_ref(), done) {
+            for frame in success_terminal_ws_frames(safeguard_notice, done) {
                 let _ = sender.send(Message::Text(frame.to_string().into())).await;
             }
 

@@ -2657,7 +2657,11 @@ impl ModelProvider for ReliableModelProvider {
         let mut rejected_attempt_usage = streamed_refusal
             .as_ref()
             .and_then(|refusal| refusal.usage.as_deref().cloned());
-        let mut final_cause = None;
+        // A streamed refusal is already a terminal typed failure for its
+        // exact physical candidate. Retain it while skipping that candidate's
+        // non-streaming replay; a later distinct failure deliberately
+        // overwrites this cause below.
+        let mut final_cause = streamed_refusal.as_ref().cloned().map(anyhow::Error::new);
 
         for (model_slot, current_model) in models.iter().enumerate() {
             for (entry_index, entry) in self.model_providers.iter().enumerate() {
@@ -9272,6 +9276,91 @@ mod tests {
         assert_eq!(notice.requested_model, "requested-model");
         assert_eq!(notice.served_model, "rescue-model");
         assert_eq!(notice.category.as_deref(), Some("private-safety-category"));
+    }
+
+    #[tokio::test]
+    async fn single_candidate_streamed_refusal_retains_typed_cause_and_usage() {
+        let stream_calls = Arc::new(AtomicUsize::new(0));
+        let chat_calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableModelProvider::new_with_entries(
+            "test",
+            vec![ReliableModelProviderEntry::new(
+                "refusing",
+                "refusing.key",
+                Box::new(StreamRefusalNoChatReplayMock {
+                    stream_calls: Arc::clone(&stream_calls),
+                    chat_calls: Arc::clone(&chat_calls),
+                }) as Box<dyn ModelProvider>,
+            )],
+            0,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+        let scope = crate::dispatch::AccountedChatScope::new();
+
+        let error = scope
+            .scope(async {
+                let dispatcher = ProviderDispatch::from_ref(&provider);
+                let mut stream = dispatcher.stream_chat(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    "requested-model",
+                    None,
+                    StreamOptions::new(true),
+                );
+                let refusal = match stream.next().await.expect("refusal event") {
+                    Err(StreamError::ModelRefusal(refusal)) => *refusal,
+                    other => panic!("expected typed refusal, got {other:?}"),
+                };
+                scope.record_stream_interruption_usage(
+                    refusal.usage.as_deref().expect("refusal usage").clone(),
+                );
+                dispatcher
+                    .chat_after_stream_refusal(
+                        ChatRequest {
+                            messages: &messages,
+                            tools: None,
+                            thinking: None,
+                        },
+                        "requested-model",
+                        None,
+                        refusal,
+                    )
+                    .await
+                    .expect_err("the only physical candidate already refused")
+            })
+            .await;
+
+        assert_eq!(stream_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            chat_calls.load(Ordering::SeqCst),
+            0,
+            "refusal must not replay"
+        );
+        let refusal = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<AnthropicRefusalError>())
+            .expect("streamed refusal must remain the typed terminal cause");
+        assert_eq!(refusal.requested_model, "requested-model");
+        assert_eq!(refusal.category.as_deref(), Some("private-safety-category"));
+        assert!(matches!(
+            refusal.usage.as_deref(),
+            Some(TokenUsage {
+                input_tokens: Some(7),
+                output_tokens: Some(3),
+                cached_input_tokens: Some(1),
+            })
+        ));
+        let rejected = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<ReliableRejectedCompletionUsage>())
+            .expect("refusal usage must survive the Reliable error boundary");
+        assert_eq!(rejected.usage.input_tokens, Some(7));
+        assert_eq!(rejected.usage.output_tokens, Some(3));
+        assert_eq!(rejected.usage.cached_input_tokens, Some(1));
     }
 
     #[tokio::test]

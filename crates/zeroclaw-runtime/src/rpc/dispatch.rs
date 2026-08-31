@@ -2018,7 +2018,15 @@ impl RpcDispatcher {
         }
 
         match outcome {
-            Ok(TurnOutcome::Completed { text, .. }) => {
+            Ok(TurnOutcome::Completed {
+                text,
+                safeguard_fallback,
+                ..
+            }) => {
+                let text = crate::agent::append_safeguard_fallback_notice(
+                    text,
+                    safeguard_fallback.as_ref(),
+                );
                 self.emit_turn_complete(
                     &req.session_id,
                     crate::rpc::types::TurnCompletionOutcome::Completed,
@@ -7859,6 +7867,7 @@ mod tests {
         let outcome = Ok(TurnOutcome::Completed {
             text: "new-assistant".into(),
             messages: new_messages.clone(),
+            safeguard_fallback: None,
         });
 
         assert_eq!(persist_acp_turn(&store, sid, &outcome).await, None);

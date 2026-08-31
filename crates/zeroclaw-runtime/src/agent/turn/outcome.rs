@@ -159,6 +159,39 @@ pub fn terminal_completion_error_message(
         .then(|| pre_executed_tools_without_final_response_message(agent_name))
 }
 
+/// Render a safeguard fallback as display-only text at a runtime delivery
+/// boundary. The provider-owned notice is the canonical accepted-route fact;
+/// this helper only resolves its localized presentation when a caller needs a
+/// text surface (direct Agent, CLI, RPC, or ACP).
+pub fn append_safeguard_fallback_notice(
+    mut response: String,
+    notice: Option<&zeroclaw_providers::SafeguardFallbackNotice>,
+) -> String {
+    let Some(notice) = notice else {
+        return response;
+    };
+    let key = match notice.kind {
+        zeroclaw_providers::SafeguardFallbackKind::ServerSide => {
+            "channel-runtime-safeguard-footer-server"
+        }
+        zeroclaw_providers::SafeguardFallbackKind::ClientSide => {
+            "channel-runtime-safeguard-footer-client"
+        }
+        zeroclaw_providers::SafeguardFallbackKind::ClientAndServer => {
+            "channel-runtime-safeguard-footer-client-server"
+        }
+    };
+    response.push_str("\n\n---\n");
+    response.push_str(&crate::i18n::get_required_cli_string_with_args(
+        key,
+        &[
+            ("requested", notice.requested_model.as_str()),
+            ("served", notice.served_model.as_str()),
+        ],
+    ));
+    response
+}
+
 #[derive(Debug)]
 pub(crate) struct StreamCancelledAfterOutput {
     pub(crate) partial_text: String,
