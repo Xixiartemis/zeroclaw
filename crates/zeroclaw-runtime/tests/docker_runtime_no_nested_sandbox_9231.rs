@@ -113,6 +113,7 @@ sandbox_backend = "docker"
         &risk_profile.sandbox_config(),
         config.runtime.kind,
         Some(install.path()),
+        &zeroclaw_runtime::security::SandboxExtraRoots::default(),
     );
     assert_eq!(
         posture.active_backend, "docker-runtime",

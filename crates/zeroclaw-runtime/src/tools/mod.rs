@@ -631,10 +631,16 @@ fn runtime_shell_assembly(
     root_config: &Config,
 ) -> RuntimeShellAssembly {
     let sandbox_cfg = risk_profile.sandbox_config();
+    let sandbox_extra_roots = crate::security::SandboxExtraRoots {
+        read_write: security.allowed_roots.clone(),
+        read_only: security.allowed_roots_read_only.clone(),
+        write_only: security.allowed_roots_write_only.clone(),
+    };
     let sandbox = create_sandbox(
         &sandbox_cfg,
         root_config.runtime.kind,
         Some(&security.workspace_dir),
+        &sandbox_extra_roots,
     );
     let shell_tool = ShellTool::new_with_sandbox(security, runtime, sandbox.clone());
     RuntimeShellAssembly {
