@@ -5,11 +5,10 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use zeroclaw_api::tool::Tool;
 use zeroclaw_config::autonomy::AutonomyLevel;
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::schema::{
-    AliasedAgentConfig, MemoryConfig, RiskProfileConfig, SandboxBackend, SandboxConfig,
+    AliasedAgentConfig, Config, MemoryConfig, RiskProfileConfig, SandboxBackend, SandboxConfig,
 };
 use zeroclaw_memory::{Memory, create_memory};
 use zeroclaw_runtime::agent::agent::{Agent, tool_dispatcher_for_provider};
@@ -131,21 +130,45 @@ pub fn write_setup_files(workspace: &Path, setup: &CaseSetup) -> anyhow::Result<
 /// building block for the deferred follow-up (a read-confining eval sandbox
 /// contract), not dead code to delete; it remains directly testable via this
 /// function and `live_shell_sandbox`/`ensure_real_sandbox`.
-fn live_tool_registry(
+async fn live_tool_registry(
     effective: &[String],
     policy: Arc<SecurityPolicy>,
-) -> anyhow::Result<Vec<Box<dyn Tool>>> {
-    if effective.is_empty() {
-        return Ok(crate::tools::default_tools());
-    }
-    let mut tools = if effective.iter().any(|t| t == "shell") {
+) -> anyhow::Result<zeroclaw_runtime::tools::scoped::ScopedToolRegistry> {
+    let mut tools = if effective.is_empty() {
+        crate::tools::default_tools()
+    } else if effective.iter().any(|t| t == "shell") {
         let sandbox = live_shell_sandbox(&policy.workspace_dir)?;
-        zeroclaw_runtime::tools::default_tools_with_sandbox(policy, sandbox)
+        zeroclaw_runtime::tools::default_tools_with_sandbox(policy.clone(), sandbox)
     } else {
-        zeroclaw_runtime::tools::default_tools(policy)
+        zeroclaw_runtime::tools::default_tools(policy.clone())
     };
-    tools.retain(|t| effective.iter().any(|name| name == t.name()));
-    Ok(tools)
+    if !effective.is_empty() {
+        tools.retain(|t| effective.iter().any(|name| name == t.name()));
+    }
+
+    let config = Config::default();
+    Ok(
+        zeroclaw_runtime::tools::scoped::ScopedToolRegistry::assemble(
+            zeroclaw_runtime::tools::scoped::ScopedAssembly {
+                config: &config,
+                agent_alias: "eval-live",
+                security: &policy,
+                built: zeroclaw_runtime::tools::AllToolsResult::from_prebuilt_tools(tools),
+                skills: &[],
+                runtime: Arc::new(zeroclaw_runtime::platform::NativeRuntime::new()),
+                caller_allowed: None,
+                connect_mcp: false,
+                connect_peripherals: false,
+                exclude_memory: false,
+                acp_delivery: false,
+                list_deferred_mcp_specs: false,
+                emit_assembly_logs: false,
+                mcp_registry: None,
+            },
+        )
+        .await
+        .registry,
+    )
 }
 
 /// Resolve the OS sandbox backend that will confine the live shell tool's
@@ -200,7 +223,7 @@ pub async fn run_live_case(trace: &LlmTrace, deps: &RunDeps) -> anyhow::Result<R
         autonomy: AutonomyLevel::Supervised,
         workspace_dir: tmp.path().to_path_buf(),
         workspace_only: true,
-        allowed_tools: Some(effective.clone()),
+        allowed_tools: (!effective.is_empty()).then(|| effective.clone()),
         ..SecurityPolicy::default()
     });
 
@@ -215,15 +238,11 @@ pub async fn run_live_case(trace: &LlmTrace, deps: &RunDeps) -> anyhow::Result<R
     };
     let approvals = Arc::new(ApprovalManager::for_non_interactive_backchannel(&risk));
 
-    let tools = live_tool_registry(&effective, policy.clone())?;
-    // Empty allowlist -> None so the echo registry's own tool is usable; a
-    // `Some(vec![])` would deny every tool including echo. Non-empty -> the
-    // allowlist backs the already-filtered registry as defense in depth.
-    let allowed_arg = if effective.is_empty() {
-        None
-    } else {
-        Some(effective.clone())
-    };
+    let tools = live_tool_registry(&effective, policy.clone()).await?;
+    // The policy is the source of truth for both assembly and the agent's
+    // defense-in-depth gate. `None` keeps the echo-only empty-allowlist
+    // registry usable; a non-empty allowlist narrows both boundaries equally.
+    let allowed_arg = policy.allowed_tools.clone();
 
     let mem_cfg = MemoryConfig {
         backend: "none".into(),
@@ -431,10 +450,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn empty_allowlist_yields_echo_only_registry() {
+    #[tokio::test]
+    async fn empty_allowlist_yields_echo_only_registry() {
         let policy = Arc::new(SecurityPolicy::default());
-        let registry = live_tool_registry(&[], policy).unwrap();
+        let registry = live_tool_registry(&[], policy).await.unwrap();
         assert_eq!(registry.len(), 1);
         assert_eq!(registry[0].name(), "echo");
     }
