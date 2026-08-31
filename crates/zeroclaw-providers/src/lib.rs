@@ -34,7 +34,10 @@ pub mod vision_override;
 
 pub use anthropic::AnthropicRefusalError;
 pub use dispatch::{AccountedChatResponse, ProviderDispatch, ProviderDispatchRef};
-pub use reliable::{ReliableRejectedCompletionUsage, ReliableSemanticEmptyCompletion};
+pub use reliable::{
+    ReliableProviderTerminalFailure, ReliableProviderTerminalFailureKind,
+    ReliableRejectedCompletionUsage, ReliableSemanticEmptyCompletion,
+};
 pub use safeguard_notice::{
     SafeguardFallbackKind, SafeguardFallbackNotice, commit_safeguard_fallback,
     scope_safeguard_fallback, take_last_safeguard_fallback,
@@ -60,7 +63,6 @@ pub fn rejected_attempt_usage_from_error(error: &anyhow::Error) -> Option<&trait
             })
         })
 }
-
 mod request_payload;
 
 #[cfg(test)]
