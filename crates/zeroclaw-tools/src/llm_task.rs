@@ -14,8 +14,16 @@ use zeroclaw_providers::ProviderDispatch;
 /// this is a pure text-in, text-out (or JSON-out) call.
 pub struct LlmTaskTool {
     security: Arc<SecurityPolicy>,
-    /// Default model_provider name from root config (e.g. "openrouter").
-    default_model_provider: String,
+    /// Root config snapshot for alias-aware provider construction.
+    /// Required so that `create_model_provider_for_alias` can look up
+    /// typed alias-specific fields (e.g. `requires_openai_auth`).
+    config: Arc<zeroclaw_config::schema::Config>,
+    /// Provider family name (e.g. "openai", "openrouter").
+    family: String,
+    /// Provider alias within the family (e.g. "codex", "primary").
+    /// Together with `family` and `config`, this enables alias-aware
+    /// provider construction that preserves alias-specific configuration.
+    alias: String,
     /// Default model from root config.
     default_model: String,
     /// Default temperature from root config. `None` means no temperature
@@ -30,7 +38,9 @@ pub struct LlmTaskTool {
 impl LlmTaskTool {
     pub fn new(
         security: Arc<SecurityPolicy>,
-        default_model_provider: String,
+        config: Arc<zeroclaw_config::schema::Config>,
+        family: String,
+        alias: String,
         default_model: String,
         default_temperature: Option<f64>,
         api_key: Option<String>,
@@ -38,12 +48,26 @@ impl LlmTaskTool {
     ) -> Self {
         Self {
             security,
-            default_model_provider,
+            config,
+            family,
+            alias,
             default_model,
             default_temperature,
             api_key,
             provider_runtime_options,
         }
+    }
+
+    /// Construct the model provider using the alias-aware factory so that
+    /// typed alias-specific configuration is preserved.
+    fn build_model_provider(&self) -> anyhow::Result<Box<dyn ModelProvider>> {
+        zeroclaw_providers::create_model_provider_for_alias(
+            &self.config,
+            &self.family,
+            &self.alias,
+            self.api_key.as_deref(),
+            &self.provider_runtime_options,
+        )
     }
 }
 
@@ -139,23 +163,17 @@ impl Tool for LlmTaskTool {
             prompt.to_string()
         };
 
-        // Create model_provider
-        let api_key_ref = self.api_key.as_deref();
-        let model_provider: Box<dyn ModelProvider> =
-            match zeroclaw_providers::create_model_provider_with_options(
-                &self.default_model_provider,
-                api_key_ref,
-                &self.provider_runtime_options,
-            ) {
-                Ok(p) => p,
-                Err(e) => {
-                    return Ok(ToolResult {
-                        success: false,
-                        output: ToolOutput::default(),
-                        error: Some(format!("Failed to create model_provider: {e}")),
-                    });
-                }
-            };
+        // Create model_provider via the alias-aware factory.
+        let model_provider: Box<dyn ModelProvider> = match self.build_model_provider() {
+            Ok(p) => p,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(format!("Failed to create model_provider: {e}")),
+                });
+            }
+        };
 
         // Make the LLM call (no tools, no agent loop). `temperature` is
         // already Option<f64>; pass straight through. None omits the field
@@ -406,16 +424,24 @@ mod tests {
 
     // ── Tool trait tests ─────────────────────────────────────────────
 
-    #[test]
-    fn tool_metadata() {
-        let tool = LlmTaskTool::new(
+    /// Helper: build an LlmTaskTool with default config for tests that
+    /// don't exercise alias-specific behavior.
+    fn default_tool() -> LlmTaskTool {
+        LlmTaskTool::new(
             Arc::new(SecurityPolicy::default()),
+            Arc::new(zeroclaw_config::schema::Config::default()),
             "openrouter".to_string(),
+            "default".to_string(),
             "test-model".to_string(),
             Some(0.7),
             None,
             zeroclaw_providers::ModelProviderRuntimeOptions::default(),
-        );
+        )
+    }
+
+    #[test]
+    fn tool_metadata() {
+        let tool = default_tool();
 
         assert_eq!(tool.name(), "llm_task");
         assert!(tool.description().contains("LLM"));
@@ -434,14 +460,7 @@ mod tests {
 
     #[tokio::test]
     async fn execute_missing_prompt_returns_error() {
-        let tool = LlmTaskTool::new(
-            Arc::new(SecurityPolicy::default()),
-            "openrouter".to_string(),
-            "test-model".to_string(),
-            Some(0.7),
-            None,
-            zeroclaw_providers::ModelProviderRuntimeOptions::default(),
-        );
+        let tool = default_tool();
 
         let result = tool.execute(json!({})).await.unwrap();
         assert!(!result.success);
@@ -450,14 +469,7 @@ mod tests {
 
     #[tokio::test]
     async fn execute_empty_prompt_returns_error() {
-        let tool = LlmTaskTool::new(
-            Arc::new(SecurityPolicy::default()),
-            "openrouter".to_string(),
-            "test-model".to_string(),
-            Some(0.7),
-            None,
-            zeroclaw_providers::ModelProviderRuntimeOptions::default(),
-        );
+        let tool = default_tool();
 
         let result = tool.execute(json!({"prompt": "  "})).await.unwrap();
         assert!(!result.success);
@@ -468,7 +480,9 @@ mod tests {
     async fn execute_with_invalid_provider_returns_error() {
         let tool = LlmTaskTool::new(
             Arc::new(SecurityPolicy::default()),
+            Arc::new(zeroclaw_config::schema::Config::default()),
             "nonexistent_provider_xyz".to_string(),
+            "default".to_string(),
             "test-model".to_string(),
             Some(0.7),
             None,
@@ -481,5 +495,43 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(result.error.as_deref().unwrap().contains("model_provider"));
+    }
+
+    // ── Regression: alias-specific provider config ───────────────────
+
+    /// Control: ordinary providers without alias-specific config are
+    /// unaffected by the alias-aware factory.  Must pass both before
+    /// and after the fix.
+    #[test]
+    fn llm_task_normal_provider_unaffected() {
+        use zeroclaw_config::schema::Config;
+
+        let config = Config::default();
+        let default_opts = zeroclaw_providers::ModelProviderRuntimeOptions::default();
+
+        // Both factories should produce equivalent providers for a
+        // normal (non-alias-specific) provider like "openrouter".
+        let alias_aware = zeroclaw_providers::create_model_provider_for_alias(
+            &config,
+            "openrouter",
+            "default",
+            None,
+            &default_opts,
+        )
+        .expect("alias-aware construction must succeed");
+
+        let legacy = zeroclaw_providers::create_model_provider_with_options(
+            "openrouter",
+            None,
+            &default_opts,
+        )
+        .expect("legacy construction must succeed");
+
+        // Both should agree on capabilities for a normal provider.
+        assert_eq!(
+            legacy.capabilities().native_tool_calling,
+            alias_aware.capabilities().native_tool_calling,
+            "normal provider must produce identical capabilities from both factories"
+        );
     }
 }
