@@ -5450,7 +5450,9 @@ mod tests {
 
         let agent = Agent::builder()
             .model_provider(Box::new(ContextExhaustedModelProvider))
-            .tools(Vec::new())
+            .tools(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new()),
+            )
             .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
             .observer(Arc::new(zeroclaw_runtime::observability::NoopObserver))
             .tool_dispatcher(Box::new(
@@ -5474,7 +5476,6 @@ mod tests {
             session_id.to_string(),
             Arc::new(Mutex::new(Session {
                 agent,
-                created_at: Instant::now(),
                 last_active: Instant::now(),
                 agent_alias: "test-agent".to_string(),
                 model_provider: "context-exhausted-test".to_string(),
