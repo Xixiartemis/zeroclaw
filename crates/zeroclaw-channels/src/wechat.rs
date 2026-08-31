@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use base64::Engine;
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, RwLock};
 use std::time::Duration;
@@ -34,14 +34,15 @@ const MAX_CONSECUTIVE_FAILURES: u32 = 3;
 const BACKOFF_DELAY: Duration = Duration::from_secs(30);
 /// Retry delay for a single failure.
 const RETRY_DELAY: Duration = Duration::from_secs(2);
-/// Initial delay before re-polling a batch held back by a retryable
-/// attachment failure. Doubles per consecutive held pass, capped at
-/// `ATTACHMENT_RETRY_MAX_DELAY`, and resets as soon as a batch commits.
+/// Initial delay before re-polling a batch held back by a retryable attachment
+/// or pairing-response failure. Doubles per consecutive held pass, capped at
+/// `BATCH_RETRY_MAX_DELAY`, and resets as soon as a batch commits.
 /// Without this, a held batch re-polls immediately in a tight loop for
 /// as long as the CDN keeps failing.
-const ATTACHMENT_RETRY_BASE_DELAY: Duration = Duration::from_secs(2);
-/// Ceiling for the attachment-retry backoff.
-const ATTACHMENT_RETRY_MAX_DELAY: Duration = Duration::from_secs(60);
+const BATCH_RETRY_BASE_DELAY: Duration = Duration::from_secs(2);
+/// Ceiling for retained-batch backoff after a retryable attachment or pairing
+/// response failure.
+const BATCH_RETRY_MAX_DELAY: Duration = Duration::from_secs(60);
 /// QR code long-poll timeout.
 const QR_POLL_TIMEOUT: Duration = Duration::from_secs(35);
 /// Maximum QR code refresh attempts.
@@ -606,15 +607,38 @@ fn sendmessage_body_error(body: &str) -> Option<String> {
     Some(format!("ret={ret}, errcode={errcode}, errmsg={errmsg:?}"))
 }
 
-/// The single in-memory owner for pairing side effects performed while a
-/// getUpdates cursor is still pending. Authorization remains owned by the
-/// canonical Config-backed peer resolver; this ledger records only whether a
-/// specific transport message already consumed its pairing attempt/reply in
-/// the retained batch.
+/// Reply selected by a pairing attempt whose getUpdates cursor is still
+/// pending. The Fluent catalogue remains the source of the actual text; this
+/// records only which response must be retried.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingPairingReply {
+    BoundSuccess,
+    InvalidCode,
+}
+
+/// State of the one pairing attempt allowed for a transport message while its
+/// getUpdates cursor remains pending.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingPairingEffect {
+    /// The attempt is reserved before crossing an async boundary.
+    AttemptReserved,
+    /// The attempt produced no response (for example, lockout).
+    NoReply,
+    /// The attempt completed, but its response has not been delivered yet.
+    ReplyPending(PendingPairingReply),
+    /// The attempt and its response both completed.
+    ReplyDelivered,
+}
+
+/// The single in-memory owner for pairing replay state while a getUpdates
+/// cursor is still pending. Authorization remains owned by the canonical
+/// Config-backed peer resolver; this ledger records the attempt disposition
+/// separately from response delivery so replay can retry a failed response
+/// without invoking `PairingGuard::try_pair` again.
 #[derive(Default)]
 struct PendingPairingEffects {
     cursor: Option<String>,
-    messages: HashSet<(String, String)>,
+    messages: HashMap<(String, String), PendingPairingEffect>,
 }
 
 /// WeChat iLink Bot channel — long-polls the iLink Bot API for updates.
@@ -1218,24 +1242,59 @@ impl WeChatChannel {
         parts.next().map(str::trim).filter(|code| !code.is_empty())
     }
 
-    /// Reserve the one pairing attempt/reply allowed for this transport
-    /// message while its batch cursor remains pending. Returning `false`
-    /// means an earlier pass (or a restarted listener on this handle) already
-    /// applied the control-plane side effect.
-    fn reserve_pending_pairing_effect(
+    /// Reserve the one pairing attempt allowed for this transport message.
+    /// An existing state is returned so retained-batch replay can retry only
+    /// a pending response.
+    fn reserve_pending_pairing_attempt(
         &self,
         batch_cursor: &str,
         from_user_id: &str,
         message_id: &str,
-    ) -> bool {
+    ) -> Option<PendingPairingEffect> {
         let mut pending = self.pending_pairing_effects.lock();
         if pending.cursor.as_deref() != Some(batch_cursor) {
             pending.cursor = Some(batch_cursor.to_string());
             pending.messages.clear();
         }
+        let key = (from_user_id.to_string(), message_id.to_string());
+        if let Some(effect) = pending.messages.get(&key) {
+            return Some(*effect);
+        }
         pending
             .messages
-            .insert((from_user_id.to_string(), message_id.to_string()))
+            .insert(key, PendingPairingEffect::AttemptReserved);
+        None
+    }
+
+    fn set_pending_pairing_effect(
+        &self,
+        batch_cursor: &str,
+        from_user_id: &str,
+        message_id: &str,
+        effect: PendingPairingEffect,
+    ) {
+        let mut pending = self.pending_pairing_effects.lock();
+        if pending.cursor.as_deref() == Some(batch_cursor) {
+            pending
+                .messages
+                .insert((from_user_id.to_string(), message_id.to_string()), effect);
+        }
+    }
+
+    fn pending_pairing_effect(
+        &self,
+        batch_cursor: &str,
+        from_user_id: &str,
+        message_id: &str,
+    ) -> Option<PendingPairingEffect> {
+        let pending = self.pending_pairing_effects.lock();
+        if pending.cursor.as_deref() != Some(batch_cursor) {
+            return None;
+        }
+        pending
+            .messages
+            .get(&(from_user_id.to_string(), message_id.to_string()))
+            .copied()
     }
 
     /// Release replay bookkeeping only after the cursor for that batch has
@@ -2395,47 +2454,116 @@ impl WeChatChannel {
         Some(ticket)
     }
 
-    /// Handle an unauthorized message (check for /bind command).
-    async fn handle_unauthorized_message(&self, from_user_id: &str, text: &str) {
-        if let Some(code) = Self::extract_bind_code(text) {
-            if let Some(pairing) = self.pairing.as_ref() {
-                match pairing.try_pair(code, from_user_id).await {
-                    Ok(Some(_token)) => {
-                        if let Err(e) = self.persist_allowed_identity(from_user_id).await {
-                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"from_user_id": from_user_id, "e": e.to_string()})), "failed to persist bound identity");
-                        }
-                        let ctx = self.get_context_token(from_user_id);
-                        let reply = wechat_cli_string("cli-wechat-bound-success");
-                        let _ = self.send_text(from_user_id, &reply, ctx.as_deref()).await;
-                        ::zeroclaw_log::record!(
-                            INFO,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_attrs(::serde_json::json!({"from_user_id": from_user_id})),
-                            "user bound via pairing code"
-                        );
-                    }
-                    Ok(None) => {
-                        let ctx = self.get_context_token(from_user_id);
-                        let reply = wechat_cli_string("cli-wechat-invalid-bind-code");
-                        let _ = self.send_text(from_user_id, &reply, ctx.as_deref()).await;
-                    }
-                    Err(e) => {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                            "pairing error"
-                        );
-                    }
+    async fn run_pairing_attempt(
+        &self,
+        from_user_id: &str,
+        code: &str,
+    ) -> Option<PendingPairingReply> {
+        let pairing = self.pairing.as_ref()?;
+        match pairing.try_pair(code, from_user_id).await {
+            Ok(Some(_token)) => {
+                if let Err(e) = self.persist_allowed_identity(from_user_id).await {
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"from_user_id": from_user_id, "e": e.to_string()})), "failed to persist bound identity");
                 }
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"from_user_id": from_user_id})),
+                    "user bound via pairing code"
+                );
+                Some(PendingPairingReply::BoundSuccess)
             }
+            Ok(None) => Some(PendingPairingReply::InvalidCode),
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "pairing error"
+                );
+                None
+            }
+        }
+    }
+
+    async fn send_pending_pairing_reply(
+        &self,
+        from_user_id: &str,
+        reply: PendingPairingReply,
+    ) -> anyhow::Result<()> {
+        let key = match reply {
+            PendingPairingReply::BoundSuccess => "cli-wechat-bound-success",
+            PendingPairingReply::InvalidCode => "cli-wechat-invalid-bind-code",
+        };
+        let context_token = self.get_context_token(from_user_id);
+        self.send_text(
+            from_user_id,
+            &wechat_cli_string(key),
+            context_token.as_deref(),
+        )
+        .await
+    }
+
+    async fn retry_pending_pairing_reply(
+        &self,
+        batch_cursor: &str,
+        from_user_id: &str,
+        message_id: &str,
+    ) -> bool {
+        let Some(PendingPairingEffect::ReplyPending(reply)) =
+            self.pending_pairing_effect(batch_cursor, from_user_id, message_id)
+        else {
+            return true;
+        };
+
+        match self.send_pending_pairing_reply(from_user_id, reply).await {
+            Ok(()) => {
+                self.set_pending_pairing_effect(
+                    batch_cursor,
+                    from_user_id,
+                    message_id,
+                    PendingPairingEffect::ReplyDelivered,
+                );
+                true
+            }
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                    "failed to deliver WeChat pairing response; retained batch replay may retry it"
+                );
+                false
+            }
+        }
+    }
+
+    /// Handle an unauthorized message. Pairing attempts and response delivery
+    /// have separate replay dispositions: a retained batch may retry a failed
+    /// response, but it never invokes `try_pair` twice for one transport
+    /// message on the same channel handle.
+    async fn handle_unauthorized_message(
+        &self,
+        batch_cursor: &str,
+        from_user_id: &str,
+        message_id: &str,
+        text: &str,
+    ) -> bool {
+        if let Some(code) = Self::extract_bind_code(text) {
+            if self
+                .reserve_pending_pairing_attempt(batch_cursor, from_user_id, message_id)
+                .is_none()
+            {
+                let effect = match self.run_pairing_attempt(from_user_id, code).await {
+                    Some(reply) => PendingPairingEffect::ReplyPending(reply),
+                    None => PendingPairingEffect::NoReply,
+                };
+                self.set_pending_pairing_effect(batch_cursor, from_user_id, message_id, effect);
+            }
+            self.retry_pending_pairing_reply(batch_cursor, from_user_id, message_id)
+                .await
         } else {
             ::zeroclaw_log::record!(
                 DEBUG,
@@ -2443,6 +2571,7 @@ impl WeChatChannel {
                     .with_attrs(::serde_json::json!({"from_user_id": from_user_id})),
                 "ignoring unauthorized message from"
             );
+            true
         }
     }
 }
@@ -2521,7 +2650,7 @@ impl Channel for WeChatChannel {
         // Consecutive polls whose batch was held back by a retryable
         // attachment failure. Drives the backoff at the commit site and
         // resets on any committed batch.
-        let mut consecutive_attachment_holds: u32 = 0;
+        let mut consecutive_batch_holds: u32 = 0;
 
         loop {
             let token = match self.get_token() {
@@ -2705,6 +2834,11 @@ impl Channel for WeChatChannel {
             // does not set this: holding the cursor forever for an
             // attachment that will never succeed would wedge the listener.
             let mut batch_has_retryable_attachment_failure = false;
+            // Pairing attempts and response delivery have separate retained
+            // dispositions. A failed response keeps the cursor pending so a
+            // replay can resend it without applying the control-plane attempt
+            // again.
+            let mut batch_has_retryable_pairing_response_failure = false;
 
             // Everything the batch wants to do downstream is staged in batch
             // order. Nothing is published to `tx` until every attachment the
@@ -2741,8 +2875,8 @@ impl Channel for WeChatChannel {
                 /// authorization before a dependent attachment later reports
                 /// a retryable failure. The cursor remains pending, but the
                 /// replay sees that canonical authorization and treats the
-                /// already-applied `/bind` as a control no-op, preventing a
-                /// second attempt or reply.
+                /// already-applied `/bind` as a control no-op. Its attempt is
+                /// never repeated; only an undelivered response may retry.
                 Unauthorized {
                     from_user_id: String,
                     message_id: String,
@@ -2799,9 +2933,16 @@ impl Channel for WeChatChannel {
                 if currently_authorized && Self::extract_bind_code(&text).is_some() {
                     // A held batch can be replayed after its bind already
                     // succeeded but before the attachment and cursor commit.
-                    // Treat that replayed control message as a no-op: it must
-                    // not reach the agent and must not repeat the pairing
-                    // attempt or success reply.
+                    // Treat that replayed control message as a no-op for the
+                    // pairing attempt and agent input. A response that failed
+                    // before the batch was held may still be retried from the
+                    // retained disposition.
+                    if !self
+                        .retry_pending_pairing_reply(&cursor, from_user_id, &message_id)
+                        .await
+                    {
+                        batch_has_retryable_pairing_response_failure = true;
+                    }
                     continue;
                 }
                 if !currently_authorized && !may_be_authorized_by_staged_bind {
@@ -2887,15 +3028,16 @@ impl Channel for WeChatChannel {
                             message_id,
                             text,
                         } => {
-                            let is_pairing_attempt = Self::extract_bind_code(&text).is_some();
-                            if !is_pairing_attempt
-                                || self.reserve_pending_pairing_effect(
+                            if !self
+                                .handle_unauthorized_message(
                                     &cursor,
                                     &from_user_id,
                                     &message_id,
+                                    &text,
                                 )
+                                .await
                             {
-                                self.handle_unauthorized_message(&from_user_id, &text).await;
+                                batch_has_retryable_pairing_response_failure = true;
                             }
                         }
                         StagedInbound::DeliverIfAuthorized {
@@ -2910,7 +3052,36 @@ impl Channel for WeChatChannel {
                                 // not make this sender canonical. Fail
                                 // closed without fetching or persisting the
                                 // attachment.
-                                self.handle_unauthorized_message(&from_user_id, &text).await;
+                                if !self
+                                    .handle_unauthorized_message(
+                                        &cursor,
+                                        &from_user_id,
+                                        &message_id,
+                                        &text,
+                                    )
+                                    .await
+                                {
+                                    batch_has_retryable_pairing_response_failure = true;
+                                }
+                                continue;
+                            }
+
+                            if Self::extract_bind_code(&text).is_some() {
+                                // Preserve control classification across a
+                                // same-batch authorization transition. A
+                                // later `/bind` must not become agent input
+                                // merely because an earlier bind made the
+                                // sender canonical during preparation.
+                                if !self
+                                    .retry_pending_pairing_reply(
+                                        &cursor,
+                                        &from_user_id,
+                                        &message_id,
+                                    )
+                                    .await
+                                {
+                                    batch_has_retryable_pairing_response_failure = true;
+                                }
                                 continue;
                             }
 
@@ -2928,8 +3099,9 @@ impl Channel for WeChatChannel {
                                     // message has crossed `tx.send`. Hold the
                                     // cursor and replay. On that replay the
                                     // now-authorized `/bind` is a control
-                                    // no-op, so its one-time code and reply
-                                    // are not repeated.
+                                    // no-op, so its one-time code is not
+                                    // consumed again. An already-delivered
+                                    // response is also suppressed.
                                     batch_has_retryable_attachment_failure = true;
                                     break;
                                 }
@@ -2954,7 +3126,9 @@ impl Channel for WeChatChannel {
             // retryable failure discards the staged messages instead —
             // they are re-fetched with the held cursor on the next pass,
             // so no inbound agent turn is delivered twice.
-            if !batch_has_retryable_attachment_failure {
+            if !batch_has_retryable_attachment_failure
+                && !batch_has_retryable_pairing_response_failure
+            {
                 for item in staged {
                     let StagedInbound::Deliver(channel_msg) = item else {
                         continue;
@@ -2989,38 +3163,41 @@ impl Channel for WeChatChannel {
             // possible (at-least-once); that trade is intentional and
             // preferable to silent message loss.
             //
-            // A batch that hit a retryable attachment failure is held back
-            // the same way: committing `next_cursor` here would permanently
-            // skip the attachment on restart, since the batch would never
-            // be re-fetched. A permanent attachment failure does not hold
-            // the cursor: the attachment is genuinely unfetchable, and
-            // holding forever would wedge the listener on it.
-            if batch_has_retryable_attachment_failure {
-                // The batch is deferred, not dropped: preparation broke at
-                // the failing message, the staged messages were discarded
-                // unpublished, and the cursor stays put — so the next poll
-                // re-fetches the identical batch and NOTHING from this
-                // pass was delivered. Back off before re-polling so a
-                // sustained CDN outage cannot spin this loop; the delay
-                // doubles per consecutive held pass up to a ceiling.
-                let delay = ATTACHMENT_RETRY_BASE_DELAY
-                    .saturating_mul(1u32 << consecutive_attachment_holds.min(5))
-                    .min(ATTACHMENT_RETRY_MAX_DELAY);
-                consecutive_attachment_holds = consecutive_attachment_holds.saturating_add(1);
+            // A batch that hit a retryable attachment failure or has an
+            // undelivered pairing response is held back the same way:
+            // committing `next_cursor` here would permanently skip the
+            // recoverable side effect. A permanent attachment failure does
+            // not hold the cursor: the attachment is genuinely unfetchable,
+            // and holding forever would wedge the listener on it.
+            if batch_has_retryable_attachment_failure
+                || batch_has_retryable_pairing_response_failure
+            {
+                // The batch is deferred, not dropped: staged inbound messages
+                // remain unpublished and the cursor stays put, so the next
+                // poll re-fetches the identical batch. Back off before
+                // re-polling so a sustained CDN or sendmessage outage cannot
+                // spin this loop; the delay doubles per consecutive held pass
+                // up to a ceiling.
+                let delay = BATCH_RETRY_BASE_DELAY
+                    .saturating_mul(1u32 << consecutive_batch_holds.min(5))
+                    .min(BATCH_RETRY_MAX_DELAY);
+                consecutive_batch_holds = consecutive_batch_holds.saturating_add(1);
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                         .with_attrs(::serde_json::json!({
-                            "consecutive_attachment_holds": consecutive_attachment_holds,
+                            "consecutive_batch_holds": consecutive_batch_holds,
+                            "retryable_attachment_failure": batch_has_retryable_attachment_failure,
+                            "pairing_response_failure": batch_has_retryable_pairing_response_failure,
                             "delay_ms": delay.as_millis() as u64,
                         })),
-                    "holding WeChat batch after retryable attachment failure; backing off before re-poll"
+                    "holding WeChat batch after retryable preparation failure; backing off before re-poll"
                 );
                 tokio::time::sleep(delay).await;
                 continue;
             }
-            consecutive_attachment_holds = 0;
+            consecutive_batch_holds = 0;
             if let Some(new_cursor) = next_cursor {
                 let committed_batch_cursor = cursor.clone();
                 cursor = new_cursor;
@@ -4316,11 +4493,225 @@ mod tests {
         let _ = handle.await;
     }
 
+    /// A failed invalid-code response retains the batch cursor by itself.
+    /// Replay must retry the response from the recorded attempt disposition
+    /// without consuming another brute-force attempt for the same transport
+    /// message.
+    #[tokio::test]
+    async fn listen_retries_failed_invalid_bind_reply_without_repeating_attempt() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let temp = tempdir().unwrap();
+        let mock_server = MockServer::start().await;
+        let (channel, config, valid_pairing_code) =
+            pairing_wechat_channel_for_mock(temp.path(), mock_server.uri());
+        let invalid_pairing_code = format!("{valid_pairing_code}x");
+
+        let batch = getupdates_batch(
+            "cursor_after_batch",
+            serde_json::json!([{
+                "from_user_id": "invalid_user",
+                "message_id": 1,
+                "create_time_ms": 1_700_000_000_000u64,
+                "item_list": [{
+                    "type": 1,
+                    "text_item": {"text": format!("/bind {invalid_pairing_code}")}
+                }]
+            }]),
+        );
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/getupdates"))
+            .and(body_partial_json(
+                serde_json::json!({"get_updates_buf": "original_cursor"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(batch))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/getupdates"))
+            .and(body_partial_json(
+                serde_json::json!({"get_updates_buf": "cursor_after_batch"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(getupdates_batch(
+                "cursor_after_batch",
+                serde_json::json!([]),
+            )))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/sendmessage"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/sendmessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ret": 0})))
+            .mount(&mock_server)
+            .await;
+        *channel.cursor.lock() = "original_cursor".to_string();
+        channel.save_sync_data();
+        let channel = Arc::new(channel);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let listen_channel = channel.clone();
+        let handle = zeroclaw_spawn::spawn!(async move { listen_channel.listen(tx).await });
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let requests = mock_server.received_requests().await.unwrap();
+                let reply_attempts = requests
+                    .iter()
+                    .filter(|request| request.url.path() == "/ilink/bot/sendmessage")
+                    .count();
+                if reply_attempts == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed invalid-code response must become observable");
+        assert_eq!(*channel.cursor.lock(), "original_cursor");
+        assert_eq!(
+            channel.pending_pairing_effect("original_cursor", "invalid_user", "1"),
+            Some(PendingPairingEffect::ReplyPending(
+                PendingPairingReply::InvalidCode
+            ))
+        );
+        assert!(
+            !config
+                .read()
+                .channel_external_peers("wechat", "wechat_test_alias")
+                .contains(&"invalid_user".to_string()),
+            "an invalid attempt must not become canonical"
+        );
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while *channel.cursor.lock() != "cursor_after_batch" {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cursor must commit after the invalid-code response retry succeeds");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), rx.recv())
+                .await
+                .is_err(),
+            "the bind control must not reach the agent"
+        );
+        assert_eq!(*channel.cursor.lock(), "cursor_after_batch");
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.url.path() == "/ilink/bot/sendmessage")
+                .count(),
+            2,
+            "replay must produce one eventual invalid-code response after the failed send"
+        );
+
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    /// A second `/bind` after a successful bind in the same batch remains a
+    /// control message. The authorization transition must not turn it into an
+    /// ordinary agent turn.
+    #[tokio::test]
+    async fn listen_keeps_later_same_batch_bind_out_of_agent_input() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let temp = tempdir().unwrap();
+        let mock_server = MockServer::start().await;
+        let (channel, config, pairing_code) =
+            pairing_wechat_channel_for_mock(temp.path(), mock_server.uri());
+        let batch = getupdates_batch(
+            "cursor_after_batch",
+            serde_json::json!([
+                {
+                    "from_user_id": "new_user",
+                    "message_id": 1,
+                    "create_time_ms": 1_700_000_000_000u64,
+                    "item_list": [{
+                        "type": 1,
+                        "text_item": {"text": format!("/bind {pairing_code}")}
+                    }]
+                },
+                {
+                    "from_user_id": "new_user",
+                    "message_id": 2,
+                    "create_time_ms": 1_700_000_001_000u64,
+                    "item_list": [{
+                        "type": 1,
+                        "text_item": {"text": "/bind another-code"}
+                    }]
+                }
+            ]),
+        );
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/getupdates"))
+            .and(body_partial_json(
+                serde_json::json!({"get_updates_buf": "original_cursor"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(batch))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/getupdates"))
+            .and(body_partial_json(
+                serde_json::json!({"get_updates_buf": "cursor_after_batch"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(getupdates_batch(
+                "cursor_after_batch",
+                serde_json::json!([]),
+            )))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/sendmessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ret": 0})))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        *channel.cursor.lock() = "original_cursor".to_string();
+        channel.save_sync_data();
+        let channel = Arc::new(channel);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let listen_channel = channel.clone();
+        let handle = zeroclaw_spawn::spawn!(async move { listen_channel.listen(tx).await });
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while *channel.cursor.lock() != "cursor_after_batch" {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("same-batch controls must commit without producing an agent turn");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), rx.recv())
+                .await
+                .is_err(),
+            "the later bind control must not reach the agent"
+        );
+        assert_eq!(
+            config
+                .read()
+                .channel_external_peers("wechat", "wechat_test_alias"),
+            vec!["new_user".to_string()]
+        );
+
+        handle.abort();
+        let _ = handle.await;
+    }
+
     /// Attachment I/O for a staged-bind sender starts only after the bind
-    /// updates canonical authorization. If that newly authorized fetch is
-    /// retryable, the cursor stays pending; replay treats the already-applied
-    /// `/bind` as a control no-op so the pairing attempt and reply happen once,
-    /// while the inbound message still waits for the attachment.
+    /// updates canonical authorization. If the first success response fails
+    /// and the newly authorized fetch retains the cursor, replay retries the
+    /// response without repeating the already-applied pairing attempt, while
+    /// the inbound message still waits for the attachment.
     #[tokio::test]
     async fn listen_replays_post_bind_attachment_failure_without_rebinding() {
         use wiremock::matchers::{body_partial_json, method, path};
@@ -4392,8 +4783,13 @@ mod tests {
             .await;
         Mock::given(method("POST"))
             .and(path("/ilink/bot/sendmessage"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/sendmessage"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ret": 0})))
-            .expect(1)
             .mount(&mock_server)
             .await;
 
@@ -4449,7 +4845,7 @@ mod tests {
                 .filter(|request| request.url.path() == "/ilink/bot/sendmessage")
                 .count(),
             1,
-            "the successful bind reply must be sent once before the held replay"
+            "the first pairing-response attempt must fail before the held replay"
         );
 
         let delivered = tokio::time::timeout(Duration::from_secs(20), rx.recv())
@@ -4475,8 +4871,8 @@ mod tests {
                 .iter()
                 .filter(|request| request.url.path() == "/ilink/bot/sendmessage")
                 .count(),
-            1,
-            "replayed bind must reply exactly once"
+            2,
+            "replay must retry the failed response without repeating the successful bind attempt"
         );
 
         handle.abort();
