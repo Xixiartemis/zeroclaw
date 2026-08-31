@@ -145,7 +145,7 @@ impl SelfSendGuard {
     /// first use. Every `SignalChannel` built for the same pair -- listener,
     /// tool handle, SOP adapter handle -- receives the same `Arc`.
     fn shared_for(http_url: &str, account: &str) -> Arc<Self> {
-        let key = (http_url.to_string(), account.to_string());
+        let key = SignalChannel::endpoint_account_key(http_url, account);
         let mut guards = SELF_SEND_GUARDS.lock();
         Arc::clone(
             guards
@@ -434,6 +434,16 @@ pub struct PollAnswer {
 }
 
 impl SignalChannel {
+    /// Canonical identity used both by self-send correlation and listener
+    /// topology checks. A trailing slash does not identify a different HTTP
+    /// daemon; the configured account remains signal-cli's account identity.
+    pub(crate) fn endpoint_account_key(http_url: &str, account: &str) -> (String, String) {
+        (
+            http_url.trim_end_matches('/').to_string(),
+            account.to_string(),
+        )
+    }
+
     pub fn new(
         http_url: String,
         account: String,
@@ -444,7 +454,7 @@ impl SignalChannel {
         ignore_attachments: bool,
         ignore_stories: bool,
     ) -> Self {
-        let http_url = http_url.trim_end_matches('/').to_string();
+        let (http_url, account) = Self::endpoint_account_key(&http_url, &account);
         let self_send_guard = SelfSendGuard::shared_for(&http_url, &account);
         Self {
             http_url,

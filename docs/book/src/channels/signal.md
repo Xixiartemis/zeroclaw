@@ -39,6 +39,15 @@ tool-facing channel handle used by the gateway, and the SOP adapter --
 shares one record. A self-send performed by any of them is recognized and
 suppressed by the listener, instead of returning as a new turn.
 
+Configure at most one enabled Signal alias for a given endpoint and account.
+The signal-cli event stream delivers the same account event to every active
+listener, so duplicate aliases would duplicate genuine notes and let only one
+listener consume a self-echo correlation entry. ZeroClaw detects aliases with
+the same normalized endpoint/account identity at channel construction and
+skips all of the conflicting aliases rather than choosing an agent
+nondeterministically. Give each alias a distinct account or endpoint, then
+reload the configuration.
+
 A confirmed self-send is cleared when its own echo arrives on the sync
 stream. ZeroClaw tracks at most 128 unresolved self-sends and never evicts
 them, because dropping one would let a late echo be replayed as a genuine
