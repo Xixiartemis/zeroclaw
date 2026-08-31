@@ -75,31 +75,30 @@ fn resolve_session_backend_for_owned_state(
         .map(Some)
 }
 
-/// Does durable owned state still exist for `alias` after its config entry is
-/// already gone?
+#[derive(Debug, Clone, Copy)]
+enum CommittedLifecycle {
+    Delete,
+    Rename,
+}
+
+/// Does durable owned state still exist for `alias` after its config mutation
+/// is already committed?
 ///
-/// This is the shared **committed-delete recovery** contract. Every supported
-/// alias lifecycle surface (gateway, CLI, RPC) persists the removal of
-/// `agents.<alias>` *before* running the owned-state cascade, and that cascade
-/// deliberately refuses to purge rows when export or durable archive writing
-/// fails. Without this check the second attempt sees no config key and reports
-/// "not configured", stranding rows that are still stamped with the deleted
-/// alias — rows a recreated alias would inherit, which is an ADR-011
-/// confidentiality boundary rather than cleanup hygiene.
-///
-/// Callers use it to decide whether a delete for an absent config key should
-/// *re-enter* the cascade instead of failing. It is deliberately
-/// **fail-toward-residue**: a store that exists but cannot be read counts as
-/// residue, so a retry surfaces the underlying failure instead of declaring
-/// convergence over state it never managed to inspect.
-pub async fn committed_delete_residue_exists(
+/// Delete and rename share every physical store probe, but memory deliberately
+/// has distinct canonical predicates: delete recovery only needs rows that
+/// require purging, while rename recovery must also detect the stable agent
+/// identity row moved by `Memory::rename_agent` when it owns zero memories.
+/// Both modes fail toward residue when state cannot be inspected.
+async fn committed_residue_exists(
     config: &Config,
     mem: Option<&Arc<dyn Memory>>,
     session_backend: Option<&Arc<dyn SessionBackend>>,
     alias: &str,
+    lifecycle: CommittedLifecycle,
 ) -> bool {
-    if config.agent_workspace_dir(alias).exists() {
-        return true;
+    match config.agent_workspace_dir(alias).try_exists() {
+        Ok(true) | Err(_) => return true,
+        Ok(false) => {}
     }
 
     if crate::cron::list_jobs_by_agent(config, alias)
@@ -123,28 +122,36 @@ pub async fn committed_delete_residue_exists(
     }
 
     match resolve_memory_for_owned_state(config, mem) {
-        Ok(Some(mem))
-            if mem
-                .export_agent(alias)
-                .await
-                .map_or(true, |rows| !rows.is_empty()) =>
-        {
-            return true;
+        Ok(Some(mem)) => {
+            let residue = match lifecycle {
+                CommittedLifecycle::Delete => mem
+                    .export_agent(alias)
+                    .await
+                    .map_or(true, |rows| !rows.is_empty()),
+                CommittedLifecycle::Rename => {
+                    mem.count_agent(alias).await.map_or(true, |count| count > 0)
+                }
+            };
+            if residue {
+                return true;
+            }
         }
         Err(_) => return true,
         Ok(_) => {}
     }
 
     let knowledge_path = config.knowledge.resolved_db_path();
-    if knowledge_path.exists() {
-        match zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
+    match knowledge_path.try_exists() {
+        Ok(true) => match zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
             &knowledge_path,
             config.knowledge.max_nodes,
         ) {
             Ok(graph) if graph.count_owner(alias).unwrap_or(1) > 0 => return true,
             Err(_) => return true,
             Ok(_) => {}
-        }
+        },
+        Err(_) => return true,
+        Ok(false) => {}
     }
 
     match resolve_session_backend_for_owned_state(config, session_backend) {
@@ -156,6 +163,50 @@ pub async fn committed_delete_residue_exists(
     }
 
     false
+}
+
+/// Does purgeable state still exist for `alias` after its config entry is
+/// already gone?
+///
+/// This is the shared **committed-delete recovery** contract. Every supported
+/// alias lifecycle surface (gateway, CLI, RPC) persists the removal of
+/// `agents.<alias>` before running the owned-state cascade. A retry re-enters
+/// that cascade while owned rows or an unreadable store remain.
+pub async fn committed_delete_residue_exists(
+    config: &Config,
+    mem: Option<&Arc<dyn Memory>>,
+    session_backend: Option<&Arc<dyn SessionBackend>>,
+    alias: &str,
+) -> bool {
+    committed_residue_exists(
+        config,
+        mem,
+        session_backend,
+        alias,
+        CommittedLifecycle::Delete,
+    )
+    .await
+}
+
+/// Does state still require re-pointing after an agent rename was committed?
+///
+/// Unlike delete recovery, memory checks the alias identity row through
+/// `Memory::count_agent`, exactly mirroring `Memory::rename_agent` even when
+/// the old alias owns no memory entries.
+pub async fn committed_rename_residue_exists(
+    config: &Config,
+    mem: Option<&Arc<dyn Memory>>,
+    session_backend: Option<&Arc<dyn SessionBackend>>,
+    alias: &str,
+) -> bool {
+    committed_residue_exists(
+        config,
+        mem,
+        session_backend,
+        alias,
+        CommittedLifecycle::Rename,
+    )
+    .await
 }
 
 /// Durable archive location and any workspace-archive failures that must be
@@ -196,25 +247,45 @@ pub async fn archive_agent_workspace(
             archive_dir.display()
         ));
     }
-    if workspace.exists() {
-        let destination = archive_dir.join("workspace");
-        if let Err(error) = tokio::fs::rename(workspace, &destination).await {
+    match workspace.try_exists() {
+        Ok(true) => {
+            let destination = archive_dir.join("workspace");
+            if let Err(error) = tokio::fs::rename(workspace, &destination).await {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "agent": alias,
+                            "from": workspace.display().to_string(),
+                            "to": destination.display().to_string(),
+                            "error": error.to_string(),
+                        })),
+                    "agent delete: workspace archive failed"
+                );
+                warnings.push(format!(
+                    "workspace archive failed ({} -> {}): {error}",
+                    workspace.display(),
+                    destination.display()
+                ));
+            }
+        }
+        Ok(false) => {}
+        Err(error) => {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                     .with_attrs(::serde_json::json!({
                         "agent": alias,
-                        "from": workspace.display().to_string(),
-                        "to": destination.display().to_string(),
+                        "workspace": workspace.display().to_string(),
                         "error": error.to_string(),
                     })),
-                "agent delete: workspace archive failed"
+                "agent delete: workspace inspection failed"
             );
             warnings.push(format!(
-                "workspace archive failed ({} -> {}): {error}",
-                workspace.display(),
-                destination.display()
+                "workspace inspection failed ({}): {error}",
+                workspace.display()
             ));
         }
     }
@@ -295,6 +366,7 @@ pub async fn cascade_owned_state(
     archive_dir: &Path,
 ) -> OwnedStateReport {
     let cascade_dir = archive_dir.join("cascade");
+    let mut warnings: Vec<String> = Vec::new();
     if let Err(err) = tokio::fs::create_dir_all(&cascade_dir).await {
         ::zeroclaw_log::record!(
             WARN,
@@ -303,8 +375,11 @@ pub async fn cascade_owned_state(
                 .with_attrs(::serde_json::json!({"path": cascade_dir.display().to_string(), "err": err.to_string()})),
             "owned-state cascade: failed to create archive directory"
         );
+        warnings.push(format!(
+            "cascade archive directory creation failed ({}): {err}",
+            cascade_dir.display()
+        ));
     }
-    let mut warnings: Vec<String> = Vec::new();
 
     let resolved_memory = match resolve_memory_for_owned_state(config, mem) {
         Ok(memory) => memory,
@@ -351,8 +426,8 @@ pub async fn cascade_owned_state(
     // cascade as memory/session state. Avoid creating an empty DB when the
     // operator has never enabled knowledge.
     let knowledge_path = config.knowledge.resolved_db_path();
-    let knowledge_purge = if knowledge_path.exists() {
-        match zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
+    let knowledge_purge = match knowledge_path.try_exists() {
+        Ok(true) => match zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
             &knowledge_path,
             config.knowledge.max_nodes,
         ) {
@@ -384,31 +459,40 @@ pub async fn cascade_owned_state(
                 warnings.push(format!("knowledge graph open: {e}"));
                 Default::default()
             }
+        },
+        Ok(false) => Default::default(),
+        Err(error) => {
+            warnings.push(format!(
+                "knowledge graph inspection ({}): {error}",
+                knowledge_path.display()
+            ));
+            Default::default()
         }
-    } else {
-        Default::default()
     };
 
     // ── cron: list → archive → remove (cron_runs cascade off job_id) ─────────
-    let cron_jobs = match crate::cron::list_jobs_by_agent(config, alias) {
-        Ok(jobs) => jobs,
+    let cron_removed = match crate::cron::list_jobs_by_agent(config, alias) {
+        Ok(jobs) => match serde_json::to_vec_pretty(&jobs).context("serialize cron export") {
+            Ok(bytes) => match write_json(&cascade_dir.join("cron.json"), bytes).await {
+                Ok(()) => match crate::cron::remove_jobs_by_agent(config, alias) {
+                    Ok(n) => n,
+                    Err(error) => {
+                        warnings.push(format!("cron remove: {error}"));
+                        0
+                    }
+                },
+                Err(error) => {
+                    warnings.push(archive_warning("cron", &error));
+                    0
+                }
+            },
+            Err(error) => {
+                warnings.push(archive_warning("cron", &error));
+                0
+            }
+        },
         Err(e) => {
             warnings.push(format!("cron list: {e}"));
-            Vec::new()
-        }
-    };
-    match serde_json::to_vec_pretty(&cron_jobs).context("serialize cron export") {
-        Ok(bytes) => {
-            if let Err(err) = write_json(&cascade_dir.join("cron.json"), bytes).await {
-                warnings.push(archive_warning("cron", &err));
-            }
-        }
-        Err(err) => warnings.push(archive_warning("cron", &err)),
-    }
-    let cron_removed = match crate::cron::remove_jobs_by_agent(config, alias) {
-        Ok(n) => n,
-        Err(e) => {
-            warnings.push(format!("cron remove: {e}"));
             0
         }
     };
@@ -416,36 +500,36 @@ pub async fn cascade_owned_state(
     // ── acp: list → archive → delete (only killed sessions remain) ───────────
     let mut acp_removed = 0;
     match AcpSessionStore::new(&config.data_dir) {
-        Ok(store) => {
-            let sessions = store.list_sessions_by_agent(alias).unwrap_or_default();
-            // AcpSessionSummary isn't Serialize; hand-map the fields we keep.
-            let json: Vec<serde_json::Value> = sessions
-                .iter()
-                .map(|s| {
-                    serde_json::json!({
-                        "session_uuid": s.session_uuid,
-                        "agent_alias": s.agent_alias,
-                        "workspace_dir": s.workspace_dir,
-                        "token_count": s.token_count,
-                        "message_count": s.message_count,
-                        "created_at": s.created_at.to_rfc3339(),
-                        "last_activity": s.last_activity.to_rfc3339(),
+        Ok(store) => match store.list_sessions_by_agent(alias) {
+            Ok(sessions) => {
+                // AcpSessionSummary isn't Serialize; hand-map the fields we keep.
+                let json: Vec<serde_json::Value> = sessions
+                    .iter()
+                    .map(|s| {
+                        serde_json::json!({
+                            "session_uuid": s.session_uuid,
+                            "agent_alias": s.agent_alias,
+                            "workspace_dir": s.workspace_dir,
+                            "token_count": s.token_count,
+                            "message_count": s.message_count,
+                            "created_at": s.created_at.to_rfc3339(),
+                            "last_activity": s.last_activity.to_rfc3339(),
+                        })
                     })
-                })
-                .collect();
-            match serde_json::to_vec_pretty(&json).context("serialize ACP export") {
-                Ok(bytes) => {
-                    if let Err(err) = write_json(&cascade_dir.join("acp.json"), bytes).await {
-                        warnings.push(archive_warning("ACP", &err));
-                    }
+                    .collect();
+                match serde_json::to_vec_pretty(&json).context("serialize ACP export") {
+                    Ok(bytes) => match write_json(&cascade_dir.join("acp.json"), bytes).await {
+                        Ok(()) => match store.delete_sessions_by_agent(alias) {
+                            Ok(n) => acp_removed = n,
+                            Err(error) => warnings.push(format!("acp delete: {error}")),
+                        },
+                        Err(error) => warnings.push(archive_warning("ACP", &error)),
+                    },
+                    Err(error) => warnings.push(archive_warning("ACP", &error)),
                 }
-                Err(err) => warnings.push(archive_warning("ACP", &err)),
             }
-            match store.delete_sessions_by_agent(alias) {
-                Ok(n) => acp_removed = n,
-                Err(e) => warnings.push(format!("acp delete: {e}")),
-            }
-        }
+            Err(error) => warnings.push(format!("acp list: {error}")),
+        },
         Err(e) => warnings.push(format!("acp store open: {e}")),
     }
 
@@ -556,8 +640,8 @@ pub async fn cascade_rename_agent(
     };
 
     let knowledge_path = config.knowledge.resolved_db_path();
-    let knowledge_rows = if knowledge_path.exists() {
-        match zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
+    let knowledge_rows = match knowledge_path.try_exists() {
+        Ok(true) => match zeroclaw_memory::knowledge_graph::KnowledgeGraph::new(
             &knowledge_path,
             config.knowledge.max_nodes,
         ) {
@@ -572,9 +656,15 @@ pub async fn cascade_rename_agent(
                 warnings.push(format!("knowledge graph open: {e}"));
                 0
             }
+        },
+        Ok(false) => 0,
+        Err(error) => {
+            warnings.push(format!(
+                "knowledge graph inspection ({}): {error}",
+                knowledge_path.display()
+            ));
+            0
         }
-    } else {
-        0
     };
 
     let cron_jobs = match crate::cron::rename_jobs_by_agent(config, from, to) {
@@ -635,5 +725,96 @@ pub async fn cascade_rename_agent(
         acp_sessions,
         sessions_repointed,
         warnings,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn archive_failure_preserves_cron_and_acp_for_retry() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        config.memory.backend = "none".to_string();
+        config.gateway.session_persistence = false;
+        config.channels.session_persistence = false;
+
+        crate::cron::add_agent_job(
+            &config,
+            "agent_a",
+            None,
+            crate::cron::Schedule::Cron {
+                expr: "*/5 * * * *".to_string(),
+                tz: None,
+            },
+            "owned cron proof",
+            crate::cron::SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            None,
+            false,
+        )
+        .unwrap();
+        let acp = AcpSessionStore::new(&config.data_dir).unwrap();
+        acp.create_session("owned-acp-proof", "agent_a", "/workspace")
+            .unwrap();
+        acp.mark_session_killed("owned-acp-proof").unwrap();
+        drop(acp);
+
+        let blocked_archive = tmp.path().join("blocked-archive");
+        std::fs::write(&blocked_archive, "not a directory").unwrap();
+        let first = cascade_owned_state(&config, None, None, "agent_a", &blocked_archive).await;
+        assert_eq!(first.cron_removed, 0);
+        assert_eq!(first.acp_removed, 0);
+        assert!(
+            first
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("cron archive"))
+        );
+        assert!(
+            first
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("ACP archive"))
+        );
+        assert_eq!(
+            crate::cron::list_jobs_by_agent(&config, "agent_a")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            AcpSessionStore::new(&config.data_dir)
+                .unwrap()
+                .list_sessions_by_agent("agent_a")
+                .unwrap()
+                .len(),
+            1
+        );
+
+        std::fs::remove_file(&blocked_archive).unwrap();
+        std::fs::create_dir(&blocked_archive).unwrap();
+        let retry = cascade_owned_state(&config, None, None, "agent_a", &blocked_archive).await;
+        assert_eq!(retry.cron_removed, 1);
+        assert_eq!(retry.acp_removed, 1);
+        assert!(retry.warnings.is_empty(), "{:?}", retry.warnings);
+        assert!(
+            crate::cron::list_jobs_by_agent(&config, "agent_a")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            AcpSessionStore::new(&config.data_dir)
+                .unwrap()
+                .list_sessions_by_agent("agent_a")
+                .unwrap()
+                .is_empty()
+        );
     }
 }

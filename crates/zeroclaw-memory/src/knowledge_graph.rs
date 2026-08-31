@@ -692,7 +692,8 @@ impl KnowledgeGraph {
     /// Add a directed edge between two nodes the scope can see. The edge
     /// is stamped with the scope's identity, so it is visible only to
     /// scopes that may read the writer's rows. Adding an edge identical
-    /// to one the scope already sees is a no-op.
+    /// to one the caller already owns is a no-op; a shared-in edge never
+    /// suppresses the caller's own durable write.
     pub fn add_edge(
         &self,
         scope: &KnowledgeScope,
@@ -721,22 +722,22 @@ impl KnowledgeGraph {
             anyhow::bail!("target node not found: {to_id}");
         }
 
-        // Idempotence within the scope: if an identical edge is already
-        // visible (own or shared-in), adding it again is a
-        // no-op rather than a per-owner duplicate.
-        let (vis_edge, edge_params) = scope.visibility_sql("owner_agent", 4);
-        let dup_sql = format!(
-            "SELECT COUNT(*) FROM edges
-             WHERE from_id = ?1 AND to_id = ?2 AND relation = ?3 AND {vis_edge}"
-        );
         let relation_str = relation.as_str();
-        let mut dup_params: Vec<&dyn rusqlite::ToSql> = vec![&from_id, &to_id, &relation_str];
-        dup_params.extend(
-            edge_params
-                .iter()
-                .map(|owner| owner as &dyn rusqlite::ToSql),
-        );
-        let existing: usize = conn.query_row(&dup_sql, &dup_params[..], |r| r.get(0))?;
+        let existing: usize = if let Some(owner) = scope.write_owner() {
+            conn.query_row(
+                "SELECT COUNT(*) FROM edges
+                 WHERE from_id = ?1 AND to_id = ?2 AND relation = ?3 AND owner_agent = ?4",
+                params![from_id, to_id, relation_str, owner],
+                |row| row.get(0),
+            )?
+        } else {
+            conn.query_row(
+                "SELECT COUNT(*) FROM edges
+                 WHERE from_id = ?1 AND to_id = ?2 AND relation = ?3 AND owner_agent IS NULL",
+                params![from_id, to_id, relation_str],
+                |row| row.get(0),
+            )?
+        };
         if existing > 0 {
             return Ok(());
         }
@@ -1079,14 +1080,16 @@ impl KnowledgeGraph {
         let depth = depth.min(Self::MAX_SUBGRAPH_DEPTH);
         let conn = self.conn.lock();
 
-        let (vis_edge, vis_params) = scope.visibility_sql("e.owner_agent", 3);
+        let (vis_root, vis_params) = scope.visibility_sql("root.owner_agent", 3);
+        let (vis_edge, _) = scope.visibility_sql("e.owner_agent", 3);
         let (vis_step, _) = scope.visibility_sql("sn.owner_agent", 3);
         let (vis_node, _) = scope.visibility_sql("n.owner_agent", 3);
 
         // Collect reachable node IDs via recursive CTE (bidirectional traversal).
         let node_sql = format!(
             "WITH RECURSIVE reachable(id, depth) AS (
-                SELECT ?1, 0
+                SELECT root.id, 0 FROM nodes root
+                WHERE root.id = ?1 AND {vis_root}
                 UNION
                 SELECT sn.id, r.depth + 1
                 FROM reachable r
@@ -2041,6 +2044,74 @@ mod tests {
         // Re-adding an edge the caller can already see stays a no-op.
         graph.add_edge(&agent_a, &a, &b, Relation::Uses).unwrap();
         assert_eq!(graph.find_outbound(&agent_a, &a, 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn shared_edge_does_not_suppress_callers_owned_relation() {
+        let (_tmp, graph, _unused) = test_graph();
+        let agent_a = agent("agent_a");
+        let agent_b_reading_a = agent_reading_from("agent_b", &["agent_a"]);
+        let agent_a_reading_b = agent_reading_from("agent_a", &["agent_b"]);
+
+        let from = graph
+            .add_node(&agent_a, NodeType::Pattern, "Owned A", "mine", &[], None)
+            .unwrap();
+        let to = graph
+            .add_node(&agent_a, NodeType::Technology, "Owned B", "mine", &[], None)
+            .unwrap();
+        graph
+            .add_edge(&agent_b_reading_a, &from, &to, Relation::Uses)
+            .unwrap();
+        graph
+            .add_edge(&agent_a_reading_b, &from, &to, Relation::Uses)
+            .unwrap();
+
+        assert_eq!(
+            graph.find_outbound(&agent_a, &from, 10).unwrap().len(),
+            1,
+            "revoking the read grant must not erase the relation agent_a recorded"
+        );
+    }
+
+    #[test]
+    fn subgraph_requires_a_scope_visible_seed_after_grant_revocation() {
+        let (_tmp, graph, _unused) = test_graph();
+        let agent_a = agent("agent_a");
+        let agent_b = agent("agent_b");
+        let agent_a_reading_b = agent_reading_from("agent_a", &["agent_b"]);
+
+        let private_root = graph
+            .add_node(
+                &agent_b,
+                NodeType::Pattern,
+                "Formerly shared root",
+                "private again",
+                &[],
+                None,
+            )
+            .unwrap();
+        let visible_node = graph
+            .add_node(
+                &agent_a,
+                NodeType::Technology,
+                "Still visible",
+                "owned",
+                &[],
+                None,
+            )
+            .unwrap();
+        graph
+            .add_edge(
+                &agent_a_reading_b,
+                &private_root,
+                &visible_node,
+                Relation::Uses,
+            )
+            .unwrap();
+
+        let (nodes, edges) = graph.get_subgraph(&agent_a, &private_root, 1).unwrap();
+        assert!(nodes.is_empty());
+        assert!(edges.is_empty());
     }
 
     #[test]

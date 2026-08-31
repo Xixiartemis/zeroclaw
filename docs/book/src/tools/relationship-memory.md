@@ -29,7 +29,7 @@ The store is one install-wide database, but entries are attributed per agent. Ev
 read_knowledge_from = ["agent_b"]
 ```
 
-The grant is directional and read-only: `agent_a` can read (and privately annotate) `agent_b`'s entries, while `agent_b` learns nothing about `agent_a`'s. Writes always attribute to the caller. A node another agent owns behaves exactly like a node that does not exist, including in `relate` errors.
+The grant is directional and read-only: `agent_a` can read (and privately annotate) `agent_b`'s entries, while `agent_b` learns nothing about `agent_a`'s. Writes always attribute to the caller. A node another agent owns behaves exactly like a node that does not exist, including in `relate` errors. A configured but disabled sibling remains a valid source so an active agent can deliberately read its retained knowledge; the disabled sibling does not run or receive reciprocal access.
 
 ### Assign pre-attribution rows during upgrade
 
@@ -61,6 +61,11 @@ cascade when the destination exists and residue remains. The CLI cannot retry
 after the source alias has been durably removed.
 [Issue #10373](https://github.com/zeroclaw-labs/zeroclaw/issues/10373) tracks a
 shared committed-rename recovery contract across all three surfaces.
+
+Delete writes recoverable memory, knowledge, cron, and ACP exports before it
+purges those stores. A list, inspection, or archive-write failure retains the
+affected state and makes a repeated delete retry the same cascade. Session
+transcripts remain in place while their retired agent attribution is cleared.
 
 The migrated edge schema retains the old three-column uniqueness rule for
 owner-less inserts, so temporarily rolling back to a pre-attribution binary does

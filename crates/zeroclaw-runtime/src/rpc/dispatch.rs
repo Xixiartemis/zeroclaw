@@ -606,20 +606,30 @@ impl RpcDispatcher {
         Ok(())
     }
 
-    async fn agent_owned_state_residue_exists(
+    async fn agent_delete_residue_exists(
         &self,
         config: &zeroclaw_config::schema::Config,
-        from: &str,
+        alias: &str,
     ) -> bool {
-        // Shared committed-delete / committed-rename recovery contract; see
-        // `agent_owned_state::committed_delete_residue_exists`. Gateway, CLI,
-        // and RPC all route through it so a recoverable cascade failure
-        // converges identically on every supported surface.
         crate::agent_owned_state::committed_delete_residue_exists(
             config,
             self.ctx.memory.as_ref(),
             self.ctx.session_backend.as_ref(),
-            from,
+            alias,
+        )
+        .await
+    }
+
+    async fn agent_rename_residue_exists(
+        &self,
+        config: &zeroclaw_config::schema::Config,
+        alias: &str,
+    ) -> bool {
+        crate::agent_owned_state::committed_rename_residue_exists(
+            config,
+            self.ctx.memory.as_ref(),
+            self.ctx.session_backend.as_ref(),
+            alias,
         )
         .await
     }
@@ -3322,10 +3332,8 @@ impl RpcDispatcher {
 
         let mut working = self.ctx.config.read().clone();
         let configured = working.agent(&req.key).is_some();
-        let resume_committed_delete = !configured
-            && self
-                .agent_owned_state_residue_exists(&working, &req.key)
-                .await;
+        let resume_committed_delete =
+            !configured && self.agent_delete_residue_exists(&working, &req.key).await;
         if !configured && !resume_committed_delete {
             return to_result(ConfigMapKeyDeleteResult {
                 path: req.path,
@@ -3505,9 +3513,7 @@ impl RpcDispatcher {
             let resume_committed_to = is_agent
                 && working.agent(&req.from).is_none()
                 && working.agent(&req.to).is_some()
-                && self
-                    .agent_owned_state_residue_exists(&working, &req.from)
-                    .await;
+                && self.agent_rename_residue_exists(&working, &req.from).await;
 
             if !resume_committed_to {
                 let report = zeroclaw_config::alias_refs::rename_with_cascade(
@@ -8215,6 +8221,72 @@ mod tests {
         assert_eq!(graph.count_owner("beta").unwrap(), 1);
     }
 
+    #[tokio::test]
+    async fn config_map_key_rename_retries_empty_memory_identity_row() {
+        use zeroclaw_api::memory_traits::Memory;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_agent_rename_test_config(&tmp);
+        config.gateway.session_persistence = false;
+        config.channels.session_persistence = false;
+
+        let seed_memory: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory_from_config(&config, None).unwrap());
+        seed_memory.ensure_agent_uuid("alpha").await.unwrap();
+        assert_eq!(seed_memory.count_agent("alpha").await.unwrap(), 1);
+        assert!(seed_memory.export_agent("alpha").await.unwrap().is_empty());
+        drop(seed_memory);
+
+        let memory_db = config.data_dir.join("memory/brain.db");
+        let saved_memory_db = config.data_dir.join("memory/brain.db.saved");
+        std::fs::rename(&memory_db, &saved_memory_db).unwrap();
+        std::fs::create_dir(&memory_db).unwrap();
+
+        let dispatcher = make_owned_state_recovery_test_dispatcher(config, None, None);
+        let first = dispatcher
+            .handle_config_map_key_rename(&json!({
+                "path": "agents",
+                "from": "alpha",
+                "to": "beta"
+            }))
+            .await
+            .expect("config rename must commit while memory rename remains retryable");
+        assert_eq!(first["renamed"], true);
+        assert!(
+            first["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| warning
+                    .as_str()
+                    .is_some_and(|warning| warning.contains("memory backend unavailable"))),
+            "the failed memory rename must be surfaced: {first:?}"
+        );
+        assert!(!dispatcher.ctx.config.read().agents.contains_key("alpha"));
+        assert!(dispatcher.ctx.config.read().agents.contains_key("beta"));
+
+        std::fs::remove_dir(&memory_db).unwrap();
+        std::fs::rename(&saved_memory_db, &memory_db).unwrap();
+
+        let retry = dispatcher
+            .handle_config_map_key_rename(&json!({
+                "path": "agents",
+                "from": "alpha",
+                "to": "beta"
+            }))
+            .await
+            .expect("retry must detect and rename the empty memory identity row");
+        assert_eq!(retry["renamed"], true);
+        assert!(retry.get("warnings").is_none(), "{retry:?}");
+
+        let committed = dispatcher.ctx.config.read().clone();
+        let reopened: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory_from_config(&committed, None).unwrap());
+        assert_eq!(reopened.count_agent("alpha").await.unwrap(), 0);
+        assert_eq!(reopened.count_agent("beta").await.unwrap(), 1);
+        assert!(reopened.export_agent("beta").await.unwrap().is_empty());
+    }
+
     fn make_agent_delete_test_config(tmp: &tempfile::TempDir) -> zeroclaw_config::schema::Config {
         let mut config = zeroclaw_config::schema::Config {
             config_path: tmp.path().join("config.toml"),
@@ -8387,6 +8459,105 @@ mod tests {
         )
         .unwrap();
         assert_eq!(graph.count_owner("alpha").unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn config_map_key_delete_retries_unreadable_workspace_before_alias_reuse() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_agent_delete_test_config(&tmp);
+        config.memory.backend = "none".to_string();
+        config.gateway.session_persistence = false;
+        config.channels.session_persistence = false;
+
+        let workspace = config.agent_workspace_dir("alpha");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("retired-marker.txt"), "prior incarnation").unwrap();
+        let workspace_root = workspace.parent().unwrap().parent().unwrap().to_path_buf();
+        let saved_workspace_root = workspace_root.with_extension("saved");
+        std::fs::rename(&workspace_root, &saved_workspace_root).unwrap();
+        std::fs::write(&workspace_root, "blocks child metadata").unwrap();
+        assert!(
+            workspace.try_exists().is_err(),
+            "the test must exercise metadata failure, not ordinary absence"
+        );
+
+        let dispatcher = make_owned_state_recovery_test_dispatcher(config, None, None);
+        let first = dispatcher
+            .handle_config_map_key_delete(&json!({
+                "path": "agents",
+                "key": "alpha"
+            }))
+            .await
+            .expect("config deletion must commit while workspace inspection is retryable");
+        assert_eq!(first["deleted"], true);
+        assert!(
+            first["owned_state"]["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| warning
+                    .as_str()
+                    .is_some_and(|warning| warning.contains("workspace inspection failed"))),
+            "the inaccessible workspace must be surfaced: {first:?}"
+        );
+
+        let blocked_retry = dispatcher
+            .handle_config_map_key_delete(&json!({
+                "path": "agents",
+                "key": "alpha"
+            }))
+            .await
+            .expect("metadata failure must count as committed-delete residue");
+        assert_eq!(blocked_retry["deleted"], true);
+        assert!(
+            blocked_retry["owned_state"]["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| warning
+                    .as_str()
+                    .is_some_and(|warning| warning.contains("workspace inspection failed"))),
+            "retry must not collapse unreadable state to absence: {blocked_retry:?}"
+        );
+
+        std::fs::remove_file(&workspace_root).unwrap();
+        std::fs::rename(&saved_workspace_root, &workspace_root).unwrap();
+        let repaired_retry = dispatcher
+            .handle_config_map_key_delete(&json!({
+                "path": "agents",
+                "key": "alpha"
+            }))
+            .await
+            .expect("retry must archive the restored workspace and converge");
+        assert_eq!(repaired_retry["deleted"], true);
+        let archive = std::path::PathBuf::from(
+            repaired_retry["owned_state"]["archived_to"]
+                .as_str()
+                .unwrap(),
+        );
+        assert!(archive.join("workspace/retired-marker.txt").exists());
+        assert!(!workspace.exists());
+
+        let converged = dispatcher
+            .handle_config_map_key_delete(&json!({
+                "path": "agents",
+                "key": "alpha"
+            }))
+            .await
+            .expect("a fully converged delete returns the ordinary absent result");
+        assert_eq!(converged["deleted"], false);
+
+        let mut recreated = dispatcher.ctx.config.read().clone();
+        recreated.agents.insert(
+            "alpha".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+        );
+        let recreated_workspace = recreated.agent_workspace_dir("alpha");
+        std::fs::create_dir_all(&recreated_workspace).unwrap();
+        assert!(
+            !recreated_workspace.join("retired-marker.txt").exists(),
+            "a recreated alias must not inherit the prior workspace"
+        );
     }
 
     #[tokio::test]
