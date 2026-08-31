@@ -5336,7 +5336,9 @@ mod tests {
                 .model_provider(Box::new(MockModelProvider {
                     responses: Mutex::new(vec![]),
                 }))
-                .tools(vec![Box::new(MockTool)])
+                .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    vec![Box::new(MockTool)],
+                ))
                 .memory(mem)
                 .observer(observer)
                 .tool_dispatcher(Box::new(NativeToolDispatcher))

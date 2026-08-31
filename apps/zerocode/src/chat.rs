@@ -4638,11 +4638,10 @@ fn session_list_click_area(overlay_area: Rect, note: Option<&str>) -> Rect {
 /// a word that would overflow the current line is pushed whole to the next one,
 /// which can cost an extra row. We mirror that word-boundary packing here so a
 /// narrow inner width (e.g. the 80x24 default) reserves enough rows for every
-/// wrapped line. Capped at [`MAX_NOTE_ROWS`] so the note can never swallow the
-/// whole list.
+/// wrapped line. The disclosure is short, fixed catalogue copy, so its full
+/// wrapped height is authoritative: clipping it would hide the persistent-
+/// memory isolation half of the contract on narrow Code panes.
 fn note_reserved_rows(note: &str, inner_width: u16) -> u16 {
-    const MAX_NOTE_ROWS: u16 = 3;
-
     if inner_width == 0 {
         return 1;
     }
@@ -4651,7 +4650,7 @@ fn note_reserved_rows(note: &str, inner_width: u16) -> u16 {
         .line_count(inner_width)
         .try_into()
         .unwrap_or(u16::MAX)
-        .clamp(1, MAX_NOTE_ROWS)
+        .max(1)
 }
 
 fn render_session_list_overlay(
@@ -4678,8 +4677,7 @@ fn render_session_list_overlay(
     // Reserve enough dim footer rows for the note (if any) to render in full at
     // the current inner width, so narrow terminals (e.g. the 80x24 default)
     // don't silently drop the second wrapped line of the memory-isolation
-    // disclosure. The reserve is capped so it never eats the whole list, and is
-    // only carved out when at least one list row survives.
+    // disclosure. It is only carved out when at least one list row survives.
     let (list_area, note_area) = match &note {
         Some(text) => {
             let reserved = note_reserved_rows(text, inner.width);
@@ -11460,6 +11458,49 @@ mod tests {
     }
 
     #[test]
+    fn agent_picker_keeps_full_memory_note_and_footer_non_clickable_when_narrow() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        // Regression guard for a 22-cell pane (20-cell bordered inner width):
+        // the catalogue copy needs more than three wrapped rows, so a fixed
+        // three-row footer clips the word "isolated" and makes the disclosure
+        // materially false at this width.
+        let _theme_guard = theme::set_active_for_test(theme::default_theme());
+        let agents = vec!["agent-a".to_string(), "agent-b".to_string()];
+        let mut list_state = ListState::default();
+        list_state.select(Some(0));
+        let area = Rect::new(0, 0, 22, 16);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut list_area = Rect::default();
+        terminal
+            .draw(|frame| {
+                list_area = draw_agent_picker(
+                    frame,
+                    area,
+                    &agents,
+                    &mut list_state,
+                    false,
+                    &PaneKind::Acp.name(),
+                    Some(crate::i18n::t("zc-chat-agent-picker-acp-memory-note")),
+                );
+            })
+            .expect("draw narrow agent picker with acp note");
+
+        let text = overlay_text(&terminal, area);
+        assert!(
+            text.contains("resumable") && text.contains("isolated"),
+            "narrow ACP picker must render the complete disclosure: {text:?}"
+        );
+
+        let footer_row = area.y + area.height - 2;
+        assert!(
+            crate::mouse::list_click_index(footer_row, list_area, 0, agents.len()).is_none(),
+            "the disclosure footer must remain outside agent-list hit testing"
+        );
+    }
+
+    #[test]
     fn agent_picker_omits_memory_isolation_note_on_chat_pane() {
         use ratatui::{Terminal, backend::TestBackend};
 
@@ -11644,8 +11685,8 @@ mod tests {
         );
         // Wide terminal: fits on one line.
         assert_eq!(note_reserved_rows(&note, 200), 1);
-        // Cap holds — never swallow the list.
-        assert!(note_reserved_rows(&note, 1) <= 3);
+        // The full disclosure remains reserved even at very narrow widths.
+        assert!(note_reserved_rows(&note, 20) > 3);
     }
 
     #[test]
